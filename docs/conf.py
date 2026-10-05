@@ -33,16 +33,14 @@ print("sys.path:", sys.path)
 # extensions coming with Sphinx (named 'sphinx.ext.*') or your custom
 # ones.
 extensions = [
-    "myst_nb",
+    "myst_parser",
     "sphinx.ext.autodoc",
     "sphinx.ext.autosummary",
     "sphinx.ext.githubpages",
     "sphinx.ext.napoleon",
-    "sphinx_design",
 ]
 autodoc_mock_imports = ["modal"]
 autodoc_typehints = "none"
-myst_enable_extensions = ["colon_fence"]
 
 # Add any paths that contain templates here, relative to this directory.
 templates_path = ["_templates"]
@@ -58,8 +56,8 @@ master_doc = "index"
 
 # General information about the project.
 project = "Cubed"
-copyright = "2022-2025"
-author = "Cubed contributors"
+copyright = "2022-2023, Tom White"
+author = "Tom White"
 
 # The version info for the project you're documenting, acts as replacement for
 # |version| and |release|, also used in various other places throughout the
@@ -107,7 +105,7 @@ html_theme = "sphinx_book_theme"
 # documentation.
 
 html_theme_options = {
-    "repository_url": "https://github.com/cubed-dev/cubed",
+    "repository_url": "https://github.com/tomwhite/cubed",
     "use_repository_button": True,
     "use_issues_button": True,
     "use_edit_page_button": True,
@@ -115,11 +113,10 @@ html_theme_options = {
     "use_fullscreen_button": False,
 }
 html_title = "Cubed"
-html_logo = "_static/cubed-logo.svg"
 
 # Add any paths that contain custom static files (such as style sheets) here,
 # relative to this directory. They are copied after the builtin static files,
 # so a file named "default.css" will overwrite the builtin "default.css".
 # html_static_path = ["_static"]
 
-html_extra_path = ["slides/intro/cubed-intro.slides.html"]
+html_extra_path = ["../examples/cubed.slides.html"]

@@ -45,23 +45,6 @@ Chunk-specific functions
 
     apply_gufunc
     map_blocks
-    map_overlap
-    rechunk
-
-Non-standardised functions
-==========================
-
-These are functions that have not (yet) been included in the Python Array API Standard.
-
-.. currentmodule:: cubed
-.. autosummary::
-    :nosignatures:
-    :toctree: generated/
-
-    isin
-    nanmean
-    nansum
-    pad
 
 Random number generation
 ========================
@@ -85,4 +68,16 @@ Runtime
     Spec
     TaskEndEvent
     measure_reserved_mem
-    raise_if_computes
+
+Executors
+=========
+
+.. currentmodule:: cubed.runtime.executors
+.. autosummary::
+    :nosignatures:
+    :toctree: generated/
+
+    beam.BeamDagExecutor
+    lithops.LithopsDagExecutor
+    modal_async.AsyncModalDagExecutor
+    python.PythonDagExecutor

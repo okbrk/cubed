@@ -207,7 +207,7 @@ def multistage_rechunking_plan(
     consolidate_reads: bool = True,
     consolidate_writes: bool = True,
 ) -> _MultistagePlan:
-    """Calculate a rechunking plan that can use multiple split/consolidate steps.
+    """Caculate a rechunking plan that can use multiple split/consolidate steps.
 
     For best results, max_mem should be significantly larger than min_mem (e.g.,
     10x). Otherwise an excessive number of rechunking steps will be required.

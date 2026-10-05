@@ -4,37 +4,31 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cubed"
-version = "0.28.0"
+version = "0.9.0"
 authors = [
     {name = "Tom White", email = "tom.e.white@gmail.com"},
 ]
 license = {text = "Apache License 2.0"}
-description = "Scalable array processing with bounded memory"
+description = "Bounded-memory serverless distributed N-dimensional array processing"
 readme = {file = "README.md", content-type = "text/markdown"}
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 3 - Alpha",
     "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
-    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.8",
 ]
-requires-python = ">=3.12"
+requires-python = ">=3.8"
 dependencies = [
     "aiostream",
-    "array-api-compat",
-    "cloudpickle",
-    "donfig",
+    "fsspec",
     "mypy_extensions", # for rechunker
-    "ndindex",
-    "networkx >= 3.3",
-    "numpy >= 2",
-    "psutil",
+    "networkx < 2.8.3",
+    "numpy >= 1.22",
     "tenacity",
     "toolz",
-    "zarr > 3.1.2",
+    "zarr",
 ]
 
 [project.optional-dependencies]
@@ -45,33 +39,16 @@ diagnostics = [
     "pydot",
     "pandas",
     "matplotlib",
-    "rich",
     "seaborn",
-    "anywidget",
 ]
-dask = ["dask < 2024.12.0"]
-dask-distributed = ["distributed < 2024.12.0"]
-icechunk = ["icechunk"]
-lithops = ["lithops[aws] >= 3.3.0"]
-lithops-aws = [
-    "cubed[diagnostics]",
-    "lithops[aws] >= 3.3.0",
-    "s3fs",
-]
-lithops-gcp = [
-    "cubed[diagnostics]",
-    "lithops[gcp] >= 3.3.0",
-    "gcsfs",
-]
+beam = ["apache-beam", "gcsfs"]
+dask = ["dask"]
+dask-distributed = ["distributed"]
+lithops = ["lithops[aws] >= 2.7.0"]
 modal = [
     "cubed[diagnostics]",
-    "modal",
+    "modal-client",
     "s3fs",
-]
-modal-gcp = [
-    "cubed[diagnostics]",
-    "modal",
-    "gcsfs",
 ]
 coiled = [
     "cubed[diagnostics]",
@@ -80,106 +57,36 @@ coiled = [
     "s3fs",
 ]
 test = [
-    "cubed[diagnostics]",
+    "apache-beam",  # beam but not gcsfs as tests use local beam runner
+    "cubed[diagnostics,lithops]",  # modal tests separate due to conflicting package reqs
     "dill",
-    "hypothesis",
-    "numpy_groupies",
-    "obstore",
+    "pytest",
+    "pytest-cov",
+    "pytest-mock",
+]
+test-dask = [
+    "cubed[dask,diagnostics]",
+    "dill",
+    "pytest",
+    "pytest-cov",
+    "pytest-mock",
+]
+test-dask-distributed = [
+    "cubed[dask-distributed,diagnostics]",
+    "dill",
+    "pytest",
+    "pytest-cov",
+    "pytest-mock",
+]
+test-modal = [
+    "cubed[modal]",
+    "dill",
     "pytest",
     "pytest-cov",
     "pytest-mock",
 ]
 
 [project.urls]
-homepage = "https://github.com/cubed-dev/cubed"
+homepage = "https://github.com/tomwhite/cubed"
 documentation = "https://tomwhite.github.io/cubed"
-repository = "https://github.com/cubed-dev/cubed"
-
-[tool.uv]
-# Backend extras are mutually exclusive and should not be resolved together.
-# Without this, uv's universal resolver can't satisfy all extras across
-# Python 3.12-3.14.
-conflicts = [
-    [
-        { extra = "lithops" },
-        { extra = "lithops-aws" },
-        { extra = "lithops-gcp" },
-        { extra = "modal" },
-        { extra = "modal-gcp" },
-        { extra = "coiled" },
-    ],
-]
-
-[tool.pytest.ini_options]
-filterwarnings = [
-    "error::UserWarning",
-]
-testpaths = "cubed/tests"
-
-[tool.ruff]
-target-version = "py312"
-
-exclude = [
-    "cubed/vendor",
-    "docs",
-    "examples",
-    ".eggs"
-]
-
-[tool.ruff.lint]
-select = [
-    "E",  # pycodestyle
-    "F",  # Pyflakes
-    "B",  # flake8-bugbear
-    "I",  # isort
-    "PT",  # flake8-pytest-style
-]
-ignore = [
-    "E402",  # Module level import not at top of file
-    "E501",  # Line too long
-    "E731",  # Do not assign a lambda expression, use a def
-    "B905",  # zip() without an explicit strict= parameter
- ]
-
-fixable = ["ALL"]
-unfixable = []
-
-[tool.ruff.lint.isort]
-known-first-party = ["cubed"]
-known-third-party = [
-    "aiostream",
-    "array-api-compat",
-    "cloudpickle",
-    "donfig",
-    "fsspec",
-    "mypy_extensions",
-    "ndindex",
-    "networkx",
-    "numpy",
-    "psutil",
-    "tenacity",
-    "toolz",
-    "zarr",
-]
-
-[tool.mypy]
-files = "cubed"
-python_version = "3.12"
-strict = false
-enable_error_code = ["truthy-bool"]
-ignore_missing_imports = true
-allow_redefinition= true
-exclude = [
-  "cubed/array_api",
-  "cubed/tests",
-  "cubed/vendor",
-  "docs"
-]
-
-[[tool.mypy.overrides]]
-# Ignore vendored libraries
-module = [ "cubed.array_api.*", "cubed.vendor.*", ]
-ignore_errors = true
-
-[tool.setuptools.package-data]
-cubed = ["py.typed"]
+repository = "https://github.com/tomwhite/cubed"

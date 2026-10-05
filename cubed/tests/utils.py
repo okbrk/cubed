@@ -1,83 +1,73 @@
 import platform
-from collections import Counter
-from collections.abc import Iterable
+from typing import Iterable
 
 import networkx as nx
 import numpy as np
+import zarr
 
-from cubed import config
-from cubed.backend_array_api import namespace as nxp
-from cubed.runtime.create import create_executor
-from cubed.runtime.types import Callback
-from cubed.storage.store import open_storage_array
+from cubed.core.array import Callback
+from cubed.runtime.executors.python import PythonDagExecutor
+from cubed.runtime.executors.python_async import AsyncPythonDagExecutor
 
-LITHOPS_LOCAL_CONFIG = {
-    "lithops": {
-        "backend": "localhost",
-        "storage": "localhost",
-        "monitoring_interval": 0.1,
-        "include_modules": None,
-    },
-    "localhost": {"version": 1},
-}
+LITHOPS_LOCAL_CONFIG = {"lithops": {"backend": "localhost", "storage": "localhost"}}
 
-ALL_EXECUTORS = [create_executor("single-threaded")]
+ALL_EXECUTORS = [PythonDagExecutor()]
 
 # don't run all tests on every executor as it's too slow, so just have a subset
-MAIN_EXECUTORS = [create_executor("single-threaded")]
+MAIN_EXECUTORS = [PythonDagExecutor()]
 
 
 if platform.system() != "Windows":
-    # ThreadsExecutor calls `peak_measured_mem` which is not supported on Windows
-    ALL_EXECUTORS.append(create_executor("threads"))
-    MAIN_EXECUTORS.append(create_executor("threads"))
+    # AsyncPythonDagExecutor calls `peak_measured_mem` which is not supported on Windows
+    ALL_EXECUTORS.append(AsyncPythonDagExecutor())
 
-    ALL_EXECUTORS.append(create_executor("processes"))
-    MAIN_EXECUTORS.append(create_executor("processes"))
 
 try:
-    ALL_EXECUTORS.append(create_executor("dask"))
-    MAIN_EXECUTORS.append(create_executor("dask"))
+    from cubed.runtime.executors.beam import BeamDagExecutor
+
+    ALL_EXECUTORS.append(BeamDagExecutor())
+
+    MAIN_EXECUTORS.append(BeamDagExecutor())
 except ImportError:
     pass
 
 try:
-    executor_options = dict(config=LITHOPS_LOCAL_CONFIG, wait_dur_sec=0.1)
-    ALL_EXECUTORS.append(create_executor("lithops", executor_options))
-    MAIN_EXECUTORS.append(create_executor("lithops", executor_options))
+    from cubed.runtime.executors.dask import DaskDelayedExecutor
+
+    ALL_EXECUTORS.append(DaskDelayedExecutor())
+
+    MAIN_EXECUTORS.append(DaskDelayedExecutor())
 except ImportError:
     pass
 
 try:
-    ALL_EXECUTORS.append(create_executor("ray"))
-    MAIN_EXECUTORS.append(create_executor("ray"))
+    from cubed.runtime.executors.dask_distributed_async import (
+        AsyncDaskDistributedExecutor,
+    )
+
+    ALL_EXECUTORS.append(AsyncDaskDistributedExecutor())
+
+    MAIN_EXECUTORS.append(AsyncDaskDistributedExecutor())
 except ImportError:
     pass
 
 try:
-    ALL_EXECUTORS.append(create_executor("spark"))
-    MAIN_EXECUTORS.append(create_executor("spark"))
+    from cubed.runtime.executors.lithops import LithopsDagExecutor
+
+    ALL_EXECUTORS.append(LithopsDagExecutor(config=LITHOPS_LOCAL_CONFIG))
+
+    MAIN_EXECUTORS.append(LithopsDagExecutor(config=LITHOPS_LOCAL_CONFIG))
 except ImportError:
     pass
-
 
 MODAL_EXECUTORS = []
 
 try:
-    # only set global config below if modal can be imported
-    import modal  # noqa: F401
+    from cubed.runtime.executors.modal import ModalDagExecutor
+    from cubed.runtime.executors.modal_async import AsyncModalDagExecutor
 
-    # need to set global config for testing modal since these options
-    # are read at the top level of modal.py to create remote functions
-    config.set(
-        {
-            "spec.executor_options.cloud": "aws",
-            "spec.executor_options.region": "us-east-1",
-            "spec.executor_options.secret": "aws-secret-us-east-1",
-        }
-    )
-    executor_options = dict(enable_output=True)
-    MODAL_EXECUTORS.append(create_executor("modal", executor_options))
+    MODAL_EXECUTORS.append(AsyncModalDagExecutor())
+    MODAL_EXECUTORS.append(ModalDagExecutor())
 except ImportError:
     pass
 
@@ -86,7 +76,7 @@ class TaskCounter(Callback):
     def __init__(self, check_timestamps=True) -> None:
         self.check_timestamps = check_timestamps
 
-    def on_compute_start(self, event):
+    def on_compute_start(self, dag, resume):
         self.value = 0
 
     def on_task_end(self, event):
@@ -101,40 +91,7 @@ class TaskCounter(Callback):
         self.value += event.num_tasks
 
 
-class CallbackCounter(Callback):
-    def __init__(self, check_timestamps=True) -> None:
-        self.check_timestamps = check_timestamps
-        self.compute_start = Counter()
-        self.compute_end = Counter()
-        self.operation_start = Counter()
-        self.operation_end = Counter()
-        self.task_end = Counter()
-
-    def on_compute_start(self, event):
-        self.compute_start.update({"compute_start": 1})
-
-    def on_compute_end(self, event):
-        self.compute_end.update({"compute_end": 1})
-
-    def on_operation_start(self, event):
-        self.operation_start.update({event.name: 1})
-
-    def on_operation_end(self, event):
-        self.operation_end.update({event.name: 1})
-
-    def on_task_end(self, event):
-        if self.check_timestamps and event.task_create_tstamp is not None:
-            assert (
-                event.task_result_tstamp
-                >= event.function_end_tstamp
-                >= event.function_start_tstamp
-                >= event.task_create_tstamp
-                > 0
-            )
-        self.task_end.update({event.name: event.num_tasks})
-
-
-def create_zarr(a, /, store, *, dtype=None, chunks=None, path=None, zarr_format=None):
+def create_zarr(a, /, store, *, dtype=None, chunks=None):
     # from dask.asarray
     if not isinstance(getattr(a, "shape", None), Iterable):
         # ensure blocks are arrays
@@ -143,15 +100,7 @@ def create_zarr(a, /, store, *, dtype=None, chunks=None, path=None, zarr_format=
         dtype = a.dtype
 
     # write to zarr
-    za = open_storage_array(
-        store,
-        mode="w",
-        shape=a.shape,
-        dtype=dtype,
-        chunks=chunks,
-        path=path,
-        zarr_format=zarr_format,
-    )
+    za = zarr.open(store, mode="w", shape=a.shape, dtype=dtype, chunks=chunks)
     za[:] = a
     return za
 
@@ -161,14 +110,3 @@ def execute_pipeline(pipeline, executor):
     dag = nx.MultiDiGraph()
     dag.add_node("node", pipeline=pipeline)
     executor.execute_dag(dag)
-
-
-try:
-    import pytest
-except ImportError:
-    pass
-else:
-    skip_if_cupy = pytest.mark.skipif(
-        "cupy" in nxp.__name__,
-        reason="CuPy is not supported",
-    )

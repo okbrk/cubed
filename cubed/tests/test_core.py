@@ -1,68 +1,47 @@
-import os
 import platform
-import random
-from functools import partial
 
 import dill
 import numpy as np
 import pytest
+import zarr
+from numpy.testing import assert_array_equal
 
 import cubed
 import cubed.array_api as xp
 import cubed.random
-from cubed._testing import assert_array_equal
-from cubed.array_api.dtypes import _floating_dtypes
-from cubed.backend_array_api import namespace as nxp
-from cubed.core.ops import (
-    _store_array,
-    general_blockwise,
-    merge_chunks,
-    partial_reduce,
-    tree_reduce,
+from cubed.core.ops import merge_chunks
+from cubed.tests.utils import (
+    ALL_EXECUTORS,
+    MAIN_EXECUTORS,
+    MODAL_EXECUTORS,
+    TaskCounter,
+    create_zarr,
 )
-from cubed.core.optimization import fuse_all_optimize_dag, multiple_inputs_optimize_dag
-from cubed.core.plan import ArrayRole
-from cubed.primitive.blockwise import ChunkKey, FunctionArgs
-from cubed.runtime.utils import raise_if_computes
-from cubed.storage.store import open_storage_array
-from cubed.tests.utils import ALL_EXECUTORS, MAIN_EXECUTORS, TaskCounter, create_zarr
 
 
-@pytest.fixture
+@pytest.fixture()
 def spec(tmp_path):
     return cubed.Spec(tmp_path, allowed_mem=100000)
 
 
-@pytest.fixture(
-    scope="module",
-    params=MAIN_EXECUTORS,
-    ids=[executor.name for executor in MAIN_EXECUTORS],
-)
+@pytest.fixture(scope="module", params=MAIN_EXECUTORS)
 def executor(request):
     return request.param
 
 
-@pytest.fixture(
-    scope="module",
-    params=ALL_EXECUTORS,
-    ids=[executor.name for executor in ALL_EXECUTORS],
-)
+@pytest.fixture(scope="module", params=ALL_EXECUTORS)
 def any_executor(request):
     return request.param
 
 
-def test_as_array_fails(spec):
-    a = np.ones((1000, 1000))
-    with pytest.raises(
-        ValueError,
-        match="Size of in memory array is 8.0 MB which exceeds maximum of 1.0 MB.",
-    ):
-        xp.asarray(a, chunks=(100, 100), spec=spec)
+@pytest.fixture(scope="module", params=MODAL_EXECUTORS)
+def modal_executor(request):
+    return request.param
 
 
 def test_regular_chunks(spec):
     xp.ones((5, 5), chunks=((2, 2, 1), (5,)), spec=spec)
-    with pytest.raises(ValueError, match="Array must have regular chunks"):
+    with pytest.raises(ValueError):
         xp.ones((5, 5), chunks=((2, 1, 2), (5,)), spec=spec)
 
 
@@ -81,7 +60,7 @@ class WrappedArray:
 
 
 @pytest.mark.parametrize(
-    ("x", "chunks", "asarray"),
+    "x,chunks,asarray",
     [
         (np.arange(25).reshape((5, 5)), (5, 5), None),
         (np.arange(25).reshape((5, 5)), (3, 2), True),
@@ -103,364 +82,80 @@ def test_from_array_zarr(tmp_path, spec):
         store=store,
     )
     a = cubed.from_array(za, spec=spec)
-    assert_array_equal(a, za[:])
+    assert_array_equal(a, za)
 
 
-@pytest.mark.parametrize("path", [None, "sub", "sub/group"])
-@pytest.mark.parametrize("zarr_format", [2, 3])
-def test_from_zarr(tmp_path, spec, executor, path, zarr_format):
+def test_from_zarr(tmp_path, spec, executor):
     store = store = tmp_path / "source.zarr"
-    za = create_zarr(
+    create_zarr(
         [[1, 2, 3], [4, 5, 6], [7, 8, 9]],
         chunks=(2, 2),
         store=store,
-        path=path,
-        zarr_format=zarr_format,
     )
-    assert za.metadata.zarr_format == zarr_format
-    a = cubed.from_zarr(store, path=path, spec=spec)
+    a = cubed.from_zarr(store, spec=spec)
     assert_array_equal(
         a.compute(executor=executor), np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]])
     )
 
 
-@pytest.mark.parametrize("chunks", [None, (2, 2), (6, 6)])
-def test_from_zarr_chunks(tmp_path, chunks):
-    store = store = tmp_path / "source.zarr"
-    create_zarr(
-        np.ones((10, 10)),
-        chunks=(2, 2),
-        store=store,
-    )
-    a = cubed.from_zarr(store, chunks=chunks)
-    assert a.chunks == chunks or (2, 2)
-    assert_array_equal(a.compute(), np.ones((10, 10)))
-
-
-def test_store(tmp_path, spec, executor):
+def test_store(tmp_path, spec):
     a = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], chunks=(2, 2), spec=spec)
 
     store = tmp_path / "source.zarr"
-    target = open_storage_array(
-        store, mode="w", shape=a.shape, dtype=a.dtype, chunks=a.chunksize
-    )
+    target = zarr.empty(a.shape, store=store)
 
-    cubed.store(a, target, executor=executor)
-    assert_array_equal(target[:], np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]]))
+    cubed.store(a, target)
+    assert_array_equal(target, np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]]))
 
 
-def test_store_lazy_compute(tmp_path, spec):
-    a = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], chunks=(2, 2), spec=spec)
-
-    store = tmp_path / "source.zarr"
-    target = open_storage_array(
-        store, mode="w", shape=a.shape, dtype=a.dtype, chunks=a.chunksize
-    )
-
-    (b,) = cubed.store(a, target, compute=False)
-
-    # target has not been computed yet
-    with pytest.raises(AssertionError):
-        assert_array_equal(target[:], np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]]))
-
-    b.compute()
-    assert_array_equal(target[:], np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]]))
-
-
-def test_store_lazy_compute_more(tmp_path, spec):
-    a = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], chunks=(2, 2), spec=spec)
-
-    store = tmp_path / "source.zarr"
-    target = open_storage_array(
-        store, mode="w", shape=a.shape, dtype=a.dtype, chunks=a.chunksize
-    )
-
-    (b,) = cubed.store(a, target, compute=False)
-
-    # do a further computation and check that store has not been optimized away
-    c = b + 1
-    res = c.compute()
-    assert_array_equal(target[:], np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]]))
-    assert_array_equal(res, np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]]) + 1)
-
-
-def test_store_multiple(tmp_path, spec, executor):
+def test_store_multiple(tmp_path, spec):
     a = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], chunks=(2, 2), spec=spec)
     b = xp.asarray([[1, 1, 1], [1, 1, 1], [1, 1, 1]], chunks=(2, 2), spec=spec)
 
     store1 = tmp_path / "source1.zarr"
-    target1 = open_storage_array(
-        store1, mode="w", shape=a.shape, dtype=a.dtype, chunks=a.chunksize
-    )
+    target1 = zarr.empty(a.shape, store=store1)
     store2 = tmp_path / "source2.zarr"
-    target2 = open_storage_array(
-        store2, mode="w", shape=b.shape, dtype=b.dtype, chunks=b.chunksize
-    )
+    target2 = zarr.empty(b.shape, store=store2)
 
-    cubed.store([a, b], [target1, target2], executor=executor)
-    assert_array_equal(target1[:], np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]]))
-    assert_array_equal(target2[:], np.array([[1, 1, 1], [1, 1, 1], [1, 1, 1]]))
+    cubed.store([a, b], [target1, target2])
+    assert_array_equal(target1, np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]]))
+    assert_array_equal(target2, np.array([[1, 1, 1], [1, 1, 1], [1, 1, 1]]))
 
 
-def test_store_fails(tmp_path, spec, executor):
+def test_store_fails(tmp_path, spec):
     a = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], chunks=(2, 2), spec=spec)
     b = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], chunks=(2, 2), spec=spec)
     store = tmp_path / "source.zarr"
-    target = open_storage_array(
-        store, mode="w", shape=a.shape, dtype=a.dtype, chunks=a.chunksize
-    )
+    target = zarr.empty(a.shape, store=store)
 
     with pytest.raises(
         ValueError, match=r"Different number of sources \(2\) and targets \(1\)"
     ):
-        cubed.store([a, b], [target], executor=executor)
+        cubed.store([a, b], [target])
 
     with pytest.raises(ValueError, match="All sources must be cubed array objects"):
-        cubed.store([1], [target], executor=executor)
+        cubed.store([1], [target])
 
 
-@pytest.mark.parametrize("path", [None, "sub", "sub/group"])
-def test_to_zarr(tmp_path, spec, executor, path):
+def test_to_zarr(tmp_path, spec, executor):
     a = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], chunks=(2, 2), spec=spec)
-    store = tmp_path / "output.zarr"
-    cubed.to_zarr(a, store, path=path, executor=executor)
-    res = open_storage_array(store, mode="r", path=path)
+    output = tmp_path / "output.zarr"
+    cubed.to_zarr(a, output, executor=executor)
+    res = zarr.open(output)
     assert_array_equal(res[:], np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]]))
-
-
-def test_to_zarr_array(tmp_path, spec, executor):
-    a = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], chunks=(2, 2), spec=spec)
-    store = tmp_path / "output.zarr"
-    z = create_zarr(
-        np.zeros(a.shape, dtype=a.dtype),
-        chunks=(2, 2),
-        store=store,
-    )
-    cubed.to_zarr(a, z, executor=executor)
-    res = open_storage_array(store, mode="r")
-    assert_array_equal(res[:], np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]]))
-
-
-def test_to_zarr_lazy_compute(tmp_path, spec):
-    a = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], chunks=(2, 2), spec=spec)
-    store = tmp_path / "output.zarr"
-    z = create_zarr(
-        np.zeros(a.shape, dtype=a.dtype),
-        chunks=(2, 2),
-        store=store,
-    )
-    b = cubed.to_zarr(a, z, compute=False)
-    # target has not been computed yet
-    res = open_storage_array(store, mode="r")
-    with pytest.raises(AssertionError):
-        assert_array_equal(res[:], np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]]))
-
-    b.compute()
-    res = open_storage_array(store, mode="r")
-    assert_array_equal(res[:], np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]]))
-
-
-def test_to_zarr_region(tmp_path, spec, executor):
-    a = xp.asarray(
-        [
-            [1, 2, 3, 4],
-            [5, 6, 7, 8],
-            [9, 10, 11, 12],
-            [13, 14, 15, 16],
-            [17, 18, 19, 20],
-        ],
-        chunks=(2, 2),
-        spec=spec,
-    )
-    store = tmp_path / "output.zarr"
-    z = create_zarr(
-        np.zeros((5, 5), dtype=a.dtype),
-        chunks=(2, 2),
-        store=store,
-    )
-    # note that the same zarr store is overwritten in the following tests
-
-    region = (slice(0, 2), slice(0, 2))
-
-    # need to use internal _store_array function to access plan
-    # since to_zarr is eager
-    assert _store_array(a[:2, :2], z, region=region).plan().num_tasks == 1
-
-    cubed.to_zarr(a[:2, :2], z, region=region, executor=executor)
-    res = open_storage_array(store, mode="r")
-    assert_array_equal(res[region], np.array([[1, 2], [5, 6]]))
-    assert_array_equal(
-        res[:],
-        np.array(
-            [
-                [1, 2, 0, 0, 0],
-                [5, 6, 0, 0, 0],
-                [0, 0, 0, 0, 0],
-                [0, 0, 0, 0, 0],
-                [0, 0, 0, 0, 0],
-            ]
-        ),
-    )
-
-    region = (slice(2, 4), slice(0, 4))
-    cubed.to_zarr(a[0:2, 0:4], z, region=region, executor=executor)
-    res = open_storage_array(store, mode="r")
-    assert_array_equal(
-        res[:],
-        np.array(
-            [
-                [1, 2, 0, 0, 0],
-                [5, 6, 0, 0, 0],
-                [1, 2, 3, 4, 0],
-                [5, 6, 7, 8, 0],
-                [0, 0, 0, 0, 0],
-            ]
-        ),
-    )
-
-    region = (slice(2, 5), slice(2, 5))
-    cubed.to_zarr(a[0:3, 0:3], z, region=region, executor=executor)
-    res = open_storage_array(store, mode="r")
-    assert_array_equal(
-        res[:],
-        np.array(
-            [
-                [1, 2, 0, 0, 0],
-                [5, 6, 0, 0, 0],
-                [1, 2, 1, 2, 3],
-                [5, 6, 5, 6, 7],
-                [0, 0, 9, 10, 11],
-            ]
-        ),
-    )
-
-    region = (slice(2, 5), slice(4, 5))
-    cubed.to_zarr(a[0:3, 0:1], z, region=region, executor=executor)
-    res = open_storage_array(store, mode="r")
-    assert_array_equal(
-        res[:],
-        np.array(
-            [
-                [1, 2, 0, 0, 0],
-                [5, 6, 0, 0, 0],
-                [1, 2, 1, 2, 1],
-                [5, 6, 5, 6, 5],
-                [0, 0, 9, 10, 9],
-            ]
-        ),
-    )
-
-    region = (slice(None), slice(4, 5))
-    cubed.to_zarr(a[:, 0:1], z, region=region, executor=executor)
-    res = open_storage_array(store, mode="r")
-    assert_array_equal(
-        res[:],
-        np.array(
-            [
-                [1, 2, 0, 0, 1],
-                [5, 6, 0, 0, 5],
-                [1, 2, 1, 2, 9],
-                [5, 6, 5, 6, 13],
-                [0, 0, 9, 10, 17],
-            ]
-        ),
-    )
-
-
-def test_to_zarr_region_fails(tmp_path):
-    a = xp.ones((4, 4), chunks=(2, 2))
-
-    region = (slice(0, 2), slice(0, 2))
-    with pytest.raises(
-        ValueError, match=r"Target store must be specified when setting a region"
-    ):
-        cubed.to_zarr(a[:2, :2], store=None, region=region)
-
-    store = tmp_path / "output.zarr"
-    z = create_zarr(
-        np.zeros((7, 5), dtype=a.dtype),
-        chunks=(2, 2),
-        store=store,
-    )
-
-    region = (slice(0, 4), slice(2, 4))
-    with pytest.raises(
-        ValueError,
-        match=r"Source array shape \(4, 3\) does not match region shape \(4, 2\)",
-    ):
-        cubed.to_zarr(a[:4, :3], z, region=region)
-
-    region = (slice(0, 4), slice(1, 4))
-    with pytest.raises(
-        ValueError,
-        match=r"Region \(slice\(0, 4, None\), slice\(1, 4, None\)\) does not align with target chunks \(2, 2\)",
-    ):
-        cubed.to_zarr(a[:4, :3], z, region=region)
-
-    region = (slice(0, 4), slice(0, 3))
-    with pytest.raises(
-        ValueError,
-        match=r"Region \(slice\(0, 4, None\), slice\(0, 3, None\)\) does not align with target chunks \(2, 2\)",
-    ):
-        cubed.to_zarr(a[:4, :3], z, region=region)
-
-
-@pytest.mark.parametrize("optimize_graph", [False, True])
-@pytest.mark.filterwarnings("ignore::UserWarning")
-def test_to_zarr_from_in_mem(tmp_path, optimize_graph):
-    a = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], chunks=(2, 2))
-    store = tmp_path / "output.zarr"
-    b = cubed.to_zarr(a, store, compute=False)
-    b.compute(optimize_graph=optimize_graph)
-    res = open_storage_array(store, mode="r")
-    assert_array_equal(res[:], np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]]))
-
-
-@pytest.mark.parametrize("optimize_graph", [False, True])
-def test_to_zarr_from_op(tmp_path, optimize_graph):
-    a = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], chunks=(2, 2))
-    b = xp.negative(a)
-    store = tmp_path / "output.zarr"
-    c = cubed.to_zarr(b, store, compute=False)
-    c.compute(optimize_graph=optimize_graph)
-    res = open_storage_array(store, mode="r")
-    assert_array_equal(res[:], np.array([[-1, -2, -3], [-4, -5, -6], [-7, -8, -9]]))
-
-
-@pytest.mark.parametrize("optimize_graph", [False, True])
-def test_to_zarr_from_rechunk(tmp_path, optimize_graph):
-    a = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], chunks=(2, 2))
-    b = a.rechunk((3, 1))
-    store = tmp_path / "output.zarr"
-    c = cubed.to_zarr(b, store, compute=False)
-    c.compute(optimize_graph=optimize_graph)
-    res = open_storage_array(store, mode="r")
-    assert_array_equal(res[:], np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]]))
-
-
-@pytest.mark.parametrize("optimize_graph", [False, True])
-def test_to_zarr_from_rechunk_and_op(tmp_path, optimize_graph):
-    a = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], chunks=(2, 2))
-    b = a.rechunk((3, 1))
-    c = xp.negative(b)
-    store = tmp_path / "output.zarr"
-    d = cubed.to_zarr(c, store, compute=False)
-    d.compute(optimize_graph=optimize_graph)
-    res = open_storage_array(store, mode="r")
-    assert_array_equal(res[:], np.array([[-1, -2, -3], [-4, -5, -6], [-7, -8, -9]]))
 
 
 def test_map_blocks_with_kwargs(spec, executor):
     # based on dask test
     a = xp.asarray([0, 1, 2, 3, 4, 5, 6, 7, 8, 9], chunks=5, spec=spec)
-    b = cubed.map_blocks(nxp.max, a, axis=0, keepdims=True, dtype=a.dtype, chunks=(1,))
+    b = cubed.map_blocks(np.max, a, axis=0, keepdims=True, dtype=a.dtype, chunks=(1,))
     assert_array_equal(b.compute(executor=executor), np.array([4, 9]))
 
 
 def test_map_blocks_with_block_id(spec, executor):
     # based on dask test
     def func(block, block_id=None, c=0):
-        return nxp.ones_like(block) * int(sum(block_id)) + c
+        return np.ones_like(block) * sum(block_id) + c
 
     a = xp.arange(10, dtype="int64", chunks=(2,))
     b = cubed.map_blocks(func, a, dtype="int64")
@@ -486,19 +181,6 @@ def test_map_blocks_with_block_id(spec, executor):
     )
 
 
-def test_map_blocks_no_array_args(spec, executor):
-    def func(block, block_id=None):
-        return nxp.ones_like(block) * int(sum(block_id))
-
-    a = cubed.map_blocks(func, dtype="int64", chunks=((5, 3),), spec=spec)
-    assert a.chunks == ((5, 3),)
-
-    assert_array_equal(
-        a.compute(executor=executor),
-        np.array([0, 0, 0, 0, 0, 1, 1, 1], dtype="int64"),
-    )
-
-
 def test_map_blocks_with_different_block_shapes(spec):
     def func(x, y):
         return x
@@ -509,35 +191,6 @@ def test_map_blocks_with_different_block_shapes(spec):
         func, a, b, dtype="int64", chunks=(1, 1, 2), drop_axis=2, new_axis=2
     )
     assert_array_equal(c.compute(), np.array([[[12, 13]]]))
-
-
-def test_map_blocks_drop_axis_chunking(spec):
-    # This tests the case illustrated in https://docs.dask.org/en/stable/generated/dask.array.map_blocks.html
-    # Unlike Dask, Cubed does not support concatenating chunks, and will fail if the dropped axis has multiple chunks.
-
-    def func(x):
-        return nxp.sum(x, axis=2)
-
-    an = np.arange(8 * 6 * 2).reshape((8, 6, 2))
-
-    # single chunk in axis=2 works fine
-    a = xp.asarray(an, chunks=(5, 4, 2), spec=spec)
-    b = cubed.map_blocks(func, a, drop_axis=2)
-    assert_array_equal(b.compute(), np.sum(an, axis=2))
-
-    # multiple chunks in axis=2 raises
-    a = xp.asarray(an, chunks=(5, 4, 1), spec=spec)
-    with pytest.raises(
-        ValueError, match=r"Cannot have multiple chunks in dropped axis 2."
-    ):
-        cubed.map_blocks(func, a, drop_axis=2)
-
-
-def test_map_blocks_with_non_cubed_array(spec):
-    a = xp.arange(10, dtype="int64", chunks=(2,), spec=spec)
-    b = np.array([1, 2], dtype="int64")  # numpy array will be coerced to cubed
-    c = cubed.map_blocks(nxp.add, a, b, dtype="int64")
-    assert_array_equal(c.compute(), np.array([1, 3, 3, 5, 5, 7, 7, 9, 9, 11]))
 
 
 def test_multiple_ops(spec, executor):
@@ -551,59 +204,36 @@ def test_multiple_ops(spec, executor):
     )
 
 
-@pytest.mark.parametrize(
-    ("new_chunks", "expected_chunks"),
-    [
-        ((1, 2), ((1, 1, 1), (2, 1))),
-        ({0: 1, 1: 2}, ((1, 1, 1), (2, 1))),
-        ({1: 2}, ((2, 1), (2, 1))),  # dim 0 unchanged
-        ({}, ((2, 1), (1, 1, 1))),  # unchanged
-    ],
-)
-def test_rechunk(spec, executor, new_chunks, expected_chunks):
+@pytest.mark.parametrize("new_chunks", [(1, 2), {0: 1, 1: 2}])
+def test_rechunk(spec, executor, new_chunks):
     a = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], chunks=(2, 1), spec=spec)
     b = a.rechunk(new_chunks)
-    assert b.chunks == expected_chunks
     assert_array_equal(
         b.compute(executor=executor),
         np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]]),
     )
 
 
-def test_rechunk_zero_size_dim(spec):
-    a = xp.zeros((0, 4), chunks=(2, 2), spec=spec)
-    b = a.rechunk((1, 3))
-    assert_array_equal(b.compute(), np.zeros((0, 4)))
-
-
 def test_rechunk_same_chunks(spec):
     a = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], chunks=(2, 1), spec=spec)
     b = a.rechunk((2, 1))
-    assert b is a
     task_counter = TaskCounter()
     res = b.compute(callbacks=[task_counter])
-    # no tasks should have run since chunks are same
-    assert task_counter.value == 0
+    # no tasks except array creation task should have run since chunks are same
+    num_created_arrays = 1
+    assert task_counter.value == num_created_arrays
 
     assert_array_equal(res, np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]]))
 
 
 # see also test_rechunk.py
 def test_rechunk_intermediate(tmp_path):
-    # factor is for chunks copies, extra 8 is for map_selection
-    factor = 5
-    spec = cubed.Spec(tmp_path, allowed_mem=5 * 8 * factor + 8)
-    a = xp.ones((5, 5), chunks=(1, 5), spec=spec)
-    b = a.rechunk((5, 1))
-    assert_array_equal(b.compute(), np.ones((5, 5)))
-    # intermediates = [n for (n, d) in b._plan.dag.nodes(data=True) if "-int" in d["name"]]
-    # assert len(intermediates) == 1
-    rechunks = [
-        n
-        for (n, d) in b._plan.dag.nodes(data=True)
-        if d.get("op_name", None) == "rechunk"
-    ]
-    assert len(rechunks) == 2  # two ops due to intermediate store
+    spec = cubed.Spec(tmp_path, allowed_mem=4 * 8 * 4)
+    a = xp.ones((4, 4), chunks=(1, 4), spec=spec)
+    b = a.rechunk((4, 1))
+    assert_array_equal(b.compute(), np.ones((4, 4)))
+    intermediates = [n for (n, d) in b.plan.dag.nodes(data=True) if "-int" in d["name"]]
+    assert len(intermediates) == 1
 
 
 def test_compute_is_idempotent(spec, executor):
@@ -611,18 +241,6 @@ def test_compute_is_idempotent(spec, executor):
     b = xp.negative(a)
     assert_array_equal(b.compute(executor=executor), -np.ones((3, 3)))
     assert_array_equal(b.compute(executor=executor), -np.ones((3, 3)))
-
-
-def test_compute_is_idempotent_structured_dtype(spec, executor):
-    # Regression: arg reductions use a structured dtype (zarr group with i/v fields);
-    # second compute raised ContainsArrayError because group fields weren't opened
-    # in append mode on re-creation. axis=None is needed to exercise the code path
-    # where the structured intermediate array is written to zarr (not fused away).
-    a = xp.asarray(np.arange(24).reshape(4, 6), chunks=(2, 3), spec=spec)
-    b = xp.argmin(a)
-    expected = np.arange(24).reshape(4, 6).argmin()
-    assert_array_equal(b.compute(executor=executor), expected)
-    assert_array_equal(b.compute(executor=executor), expected)
 
 
 def test_default_spec(executor):
@@ -637,70 +255,9 @@ def test_default_spec(executor):
 
 def test_default_spec_allowed_mem_exceeded():
     # default spec fails for large computations
-    a = xp.ones((20000, 10000), chunks=(10000, 10000))
-    b = xp.negative(a)
-    # plan() succeeds but marks plan as exceeding memory
-    plan = b.plan()
-    assert plan.exceeds_memory
-    assert len(plan.ops_exceeding_memory) == 1
-    # compute() raises the error
-    with pytest.raises(
-        ValueError,
-        match=r"Projected blockwise memory \(.+\) exceeds allowed_mem \(.+\), including reserved_mem \(.+\) for op-\d+",
-    ):
-        b.compute()
-
-
-def test_default_spec_allowed_mem_exceeded_visualize(tmp_path):
-    # visualize works but warns when memory is exceeded
-    import warnings
-
-    a = xp.ones((20000, 10000), chunks=(10000, 10000))
-    b = xp.negative(a)
-    with warnings.catch_warnings(record=True) as w:
-        warnings.simplefilter("always")
-        b.visualize(filename=str(tmp_path / "cubed"))
-        mem_warnings = [x for x in w if "exceed allowed memory" in str(x.message)]
-        assert len(mem_warnings) == 1
-
-
-def test_default_spec_config_override():
-    # override default spec to increase allowed_mem
-    from cubed import config
-
-    with config.set(
-        {
-            "spec.allowed_mem": "4GB",
-            # need to decrease max workers proportionately
-            "spec.executor_options.max_workers": os.cpu_count() // 2,
-        }
-    ):
-        a = xp.ones((20000, 10000), chunks=(10000, 10000))
-        b = xp.negative(a)
-        assert_array_equal(b.compute(), -np.ones((20000, 10000)))
-
-
-@pytest.mark.parametrize(
-    "compressor",
-    [
-        None,
-        "auto",
-        {"name": "zstd", "configuration": {"level": 1}},
-        {
-            "name": "blosc",
-            "configuration": {
-                "cname": "lz4",
-                "clevel": 2,
-                "shuffle": "shuffle",
-            },
-        },
-    ],
-)
-def test_spec_compressor(tmp_path, compressor):
-    spec = cubed.Spec(tmp_path, allowed_mem=100000, zarr_compressor=compressor)
-    a = xp.ones((3, 3), chunks=(2, 2), spec=spec)
-    b = xp.negative(a)
-    assert_array_equal(b.compute(), -np.ones((3, 3)))
+    a = xp.ones((100000, 100000), chunks=(10000, 10000))
+    with pytest.raises(ValueError):
+        xp.negative(a)
 
 
 def test_different_specs(tmp_path):
@@ -708,71 +265,49 @@ def test_different_specs(tmp_path):
     spec2 = cubed.Spec(tmp_path, allowed_mem=200000)
     a = xp.ones((3, 3), chunks=(2, 2), spec=spec1)
     b = xp.ones((3, 3), chunks=(2, 2), spec=spec2)
-    with pytest.raises(
-        ValueError, match="Arrays must have same spec in single computation"
-    ):
+    with pytest.raises(ValueError):
         xp.add(a, b)
 
 
-def test_raise_if_computes():
-    # shouldn't raise since compute has not been called
-    with raise_if_computes():
-        a = xp.ones((3, 3), chunks=(2, 2))
-        b = xp.negative(a)
+class TestSpecMemArgTypes:
+    def test_max_mem_deprecation_warning(self):
+        # Remove once max_mem fully deprecated in favour of allowed_mem
+        with pytest.warns(
+            DeprecationWarning,
+            match="`max_mem` is deprecated, please use `allowed_mem` instead",
+        ):
+            cubed.Spec(max_mem=100_000)
 
-    # should raise since compute is called
-    with pytest.raises(RuntimeError):
-        with raise_if_computes():
-            b.compute()
+    @pytest.mark.parametrize(
+        "input_value, expected_value",
+        [
+            (500, 500),
+            (100_000, 100_000),
+            ("500B", 500),
+            ("1kB", 1000),
+            ("1MB", 1000**2),
+            ("1GB", 1000**3),
+            ("1TB", 1000**4),
+            ("1PB", 1000**5),
+        ],
+    )
+    def test_convert_to_bytes(self, input_value, expected_value):
+        spec = cubed.Spec(allowed_mem=input_value)
+        assert spec.allowed_mem == expected_value
 
-    # shouldn't raise since we are outside the context manager
-    assert_array_equal(b.compute(), -np.ones((3, 3)))
-
-    # should raise since compute is called
-    c = xp.ones((3, 3), chunks=(2, 2))
-    d = xp.negative(c)
-    with pytest.raises(RuntimeError):
-        with raise_if_computes():
-            d.compute()
-
-
-@pytest.mark.parametrize(
-    ("input_value", "expected_value"),
-    [
-        (500, 500),
-        (100_000, 100_000),
-        (50.0, 50),
-        ("500B", 500),
-        ("1kB", 1000),
-        ("1MB", 1000**2),
-        ("1GB", 1000**3),
-        ("1TB", 1000**4),
-        ("1PB", 1000**5),
-        ("100_000", 100_000),
-        ("1.2MB", 1.2 * 1000**2),
-        ("1 MB", 1000**2),
-        ("1.2 MB", 1.2 * 1000**2),
-    ],
-)
-def test_convert_to_bytes(input_value, expected_value):
-    spec = cubed.Spec(allowed_mem=input_value)
-    assert spec.allowed_mem == expected_value
-
-
-@pytest.mark.parametrize(
-    "input_value",
-    [
-        "1EB",  # EB is not a valid unit in this function
-        "1kb",  # lower-case k is not valid
-        "invalid",  # completely invalid input
-        -512,  # negative integer
-        "kB",  # only unit, no value
-        "1.1B",  # can't have a fractional number of bytes
-    ],
-)
-def test_convert_to_bytes_error(input_value):
-    with pytest.raises(ValueError, match="Invalid value"):
-        cubed.Spec(allowed_mem=input_value)
+    @pytest.mark.parametrize(
+        "input_value",
+        [
+            "1EB",  # EB is not a valid unit in this function
+            "1kb",  # lower-case k is not valid
+            "invalid",  # completely invalid input
+            -512,  # negative integer
+            1000.0,  # invalid type
+        ],
+    )
+    def test_convert_to_bytes_error(self, input_value):
+        with pytest.raises(ValueError):
+            cubed.Spec(allowed_mem=input_value)
 
 
 def test_reduction_multiple_rounds(tmp_path, executor):
@@ -780,36 +315,23 @@ def test_reduction_multiple_rounds(tmp_path, executor):
     a = xp.ones((100, 10), dtype=np.uint8, chunks=(1, 10), spec=spec)
     b = xp.sum(a, axis=0, dtype=np.uint8)
     # check that there is > 1 blockwise step (after optimization)
-    finalized_plan = b.plan()
     blockwises = [
-        n
-        for (n, d) in finalized_plan.dag.nodes(data=True)
-        if d.get("op_name", None) == "blockwise"
+        n for (n, d) in b.plan.dag.nodes(data=True) if d["op_name"] == "blockwise"
     ]
     assert len(blockwises) > 1
-    assert finalized_plan.max_projected_mem <= 1000
+    assert b.plan.max_projected_mem() <= 1000
     assert_array_equal(b.compute(executor=executor), np.ones((100, 10)).sum(axis=0))
 
 
-def test_partial_reduce(spec):
-    a = xp.asarray(np.arange(242).reshape((11, 22)), chunks=(3, 4), spec=spec)
-    b = partial_reduce(a, np.sum, split_every={0: 2})
-    c = partial_reduce(b, np.sum, split_every={0: 2})
-    assert_array_equal(
-        c.compute(), np.arange(242).reshape((11, 22)).sum(axis=0, keepdims=True)
-    )
-
-
-def test_tree_reduce(spec):
-    a = xp.asarray(np.arange(242).reshape((11, 22)), chunks=(3, 4), spec=spec)
-    b = tree_reduce(a, np.sum, axis=0, dtype=np.int64, split_every={0: 2})
-    assert_array_equal(
-        b.compute(), np.arange(242).reshape((11, 22)).sum(axis=0, keepdims=True)
-    )
+def test_reduction_not_enough_memory(tmp_path):
+    spec = cubed.Spec(tmp_path, allowed_mem=50)
+    a = xp.ones((100, 10), dtype=np.uint8, chunks=(1, 10), spec=spec)
+    with pytest.raises(ValueError, match=r"Not enough memory for reduction"):
+        xp.sum(a, axis=0, dtype=np.uint8)
 
 
 @pytest.mark.parametrize(
-    ("target_chunks", "expected_chunksize"),
+    "target_chunks, expected_chunksize",
     [
         ((2, 3), None),
         ((4, 3), None),
@@ -825,21 +347,12 @@ def test_merge_chunks(spec, target_chunks, expected_chunksize):
     assert_array_equal(b.compute(), np.ones((10, 10)))
 
 
-@pytest.mark.parametrize("target_chunks", [(3, 2), (1, 3), (5, 5), (10, 10)])
+@pytest.mark.parametrize(
+    "target_chunks", [(2,), (2, 3, 1), (3, 2), (1, 3), (5, 5), (10, 10)]
+)
 def test_merge_chunks_fails(spec, target_chunks):
     a = xp.ones((10, 10), dtype=np.uint8, chunks=(2, 3), spec=spec)
-    with pytest.raises(
-        ValueError, match=r"Chunks .* must be a multiple of array's chunks"
-    ):
-        merge_chunks(a, target_chunks)
-
-
-@pytest.mark.parametrize("target_chunks", [(2,), (2, 3, 1)])
-def test_merge_chunks_fails_dim_mismatch(spec, target_chunks):
-    a = xp.ones((10, 10), dtype=np.uint8, chunks=(2, 3), spec=spec)
-    with pytest.raises(
-        ValueError, match=r"Chunks .* must have same number of dimensions as array"
-    ):
+    with pytest.raises(ValueError):
         merge_chunks(a, target_chunks)
 
 
@@ -881,17 +394,15 @@ def test_compute_multiple_different_specs(tmp_path):
     b2 = xp.ones((3, 3), chunks=(2, 2), spec=spec2)
     c2 = xp.add(a2, b2)
 
-    with pytest.raises(
-        ValueError, match="Arrays must have same spec in single computation"
-    ):
+    with pytest.raises(ValueError):
         cubed.compute(c1, c2)
 
 
 def test_visualize(tmp_path):
-    a = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], dtype=xp.float64, chunks=(2, 2))
-    b = cubed.random.random((3, 3), chunks=(2, 2))
+    a = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], chunks=(2, 2))
+    b = xp.asarray([[1, 1, 1], [1, 1, 1], [1, 1, 1]], chunks=(2, 2))
     c = xp.add(a, b)
-    d = c.rechunk((3, 1))
+    d = c * 2
     e = c * 3
 
     f = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], chunks=(2, 2))
@@ -905,9 +416,6 @@ def test_visualize(tmp_path):
     e.visualize(filename=tmp_path / "e")
     assert (tmp_path / "e.svg").exists()
 
-    e.visualize(filename=tmp_path / "e-hidden", show_hidden=True)
-    assert (tmp_path / "e-hidden.svg").exists()
-
     e.visualize(filename=tmp_path / "e", format="png")
     assert (tmp_path / "e.png").exists()
 
@@ -917,69 +425,6 @@ def test_visualize(tmp_path):
     # multiple arrays
     cubed.visualize(d, g, filename=tmp_path / "dg")
     assert (tmp_path / "dg.svg").exists()
-
-    # cytoscape
-    e.visualize(filename=tmp_path / "e", engine="cytoscape")
-    assert (tmp_path / "e.html").exists()
-
-    cubed.visualize(d, g, filename=tmp_path / "dg", engine="cytoscape")
-    assert (tmp_path / "dg.html").exists()
-
-
-def test_plan(tmp_path):
-    store = store = tmp_path / "a.zarr"
-    za = create_zarr(
-        [[1, 2, 3], [4, 5, 6], [7, 8, 9]],
-        chunks=(2, 2),
-        store=store,
-    )
-    a = cubed.from_array(za)
-    b = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], dtype=xp.float64, chunks=(2, 2))
-    c = a + b
-    d = c * 3
-
-    d.visualize(optimize_graph=False)
-
-    plan = d.plan(optimize_graph=False)
-
-    assert a.name in plan.input_array_names
-    assert b.name in plan.input_array_names
-    assert len(plan.input_array_names) == 3  # number 3 is also an input array
-    assert plan.array_names == (d.name,)
-
-    assert plan.array_role(a.name) == ArrayRole.INPUT
-    assert plan.array_role(b.name) == ArrayRole.INPUT
-    assert plan.array_role(c.name) == ArrayRole.INTERMEDIATE
-    assert plan.array_role(d.name) == ArrayRole.OUTPUT
-
-    assert plan.num_arrays == 5  # a, b, c, d, number 3
-    assert plan.num_stages == 3  # create, c, d
-    assert plan.num_primitive_ops == 3  # create arrays, c, d
-    assert plan.num_tasks == 10  # 2 for create arrays, 4 for c, 4 for d
-
-    assert plan.total_input_narrays == 1  # a
-    assert plan.total_input_nbytes == a.nbytes
-    assert plan.total_input_nchunks == a.nchunks
-
-    assert plan.total_intermediate_narrays == 1  # c
-    assert plan.total_intermediate_nbytes == c.nbytes
-    assert plan.total_intermediate_nchunks == c.nchunks
-
-    assert plan.total_output_narrays == 1  # d
-    assert plan.total_output_nbytes == d.nbytes
-    assert plan.total_output_nchunks == d.nchunks
-
-    assert plan.total_narrays == 3  # a, c, d (b is not materialized)
-    assert plan.total_nbytes == a.nbytes + c.nbytes + d.nbytes
-    assert plan.total_nchunks == a.nchunks + c.nchunks + d.nchunks
-
-    assert plan.total_narrays_read == 2  # a, c
-    assert plan.total_nbytes_read == a.nbytes + c.nbytes
-    assert plan.total_nchunks_read == a.nchunks + c.nchunks
-
-    assert plan.total_narrays_written == 2  # c, d
-    assert plan.total_nbytes_written == c.nbytes + d.nbytes
-    assert plan.total_nchunks_written == c.nchunks + d.nchunks
 
 
 def test_array_pickle(spec, executor):
@@ -1007,8 +452,12 @@ def test_array_pickle(spec, executor):
 
 @pytest.mark.skipif(platform.system() == "Windows", reason="does not run on windows")
 def test_measure_reserved_mem(executor):
-    if executor.name not in ("processes", "lithops"):
-        pytest.skip(f"{executor.name} executor does not support measure_reserved_mem")
+    pytest.importorskip("lithops")
+
+    from cubed.runtime.executors.lithops import LithopsDagExecutor
+
+    if not isinstance(executor, LithopsDagExecutor):
+        pytest.skip(f"{type(executor)} does not support measure_reserved_mem")
 
     reserved_memory = cubed.measure_reserved_mem(executor=executor)
     assert reserved_memory > 1_000_000  # over 1MB
@@ -1027,120 +476,5 @@ def test_plan_scaling(tmp_path, factor):
     )
     c = xp.matmul(a, b)
 
-    assert c.plan().num_tasks > 0
+    assert c.plan.num_tasks() > 0
     c.visualize(filename=tmp_path / "c")
-
-
-@pytest.mark.parametrize("t_length", [50, 500, 5000, 50000])
-def test_plan_quad_means(tmp_path, t_length):
-    # based on sizes from https://gist.github.com/TomNicholas/c6a28f7c22c6981f75bce280d3e28283
-    spec = cubed.Spec(tmp_path, allowed_mem="2GB", reserved_mem="100MB")
-    u = cubed.random.random((t_length, 1, 987, 1920), chunks=(10, 1, -1, -1), spec=spec)
-    v = cubed.random.random((t_length, 1, 987, 1920), chunks=(10, 1, -1, -1), spec=spec)
-    uv = u * v
-    m = xp.mean(uv, axis=0, split_every=10)
-
-    assert m.plan().num_tasks > 0
-    m.visualize(
-        filename=tmp_path / "quad_means_unoptimized",
-        optimize_graph=False,
-        show_hidden=True,
-    )
-    m.visualize(
-        filename=tmp_path / "quad_means",
-        optimize_function=multiple_inputs_optimize_dag,
-        show_hidden=True,
-    )
-
-
-def quad_means(tmp_path, t_length):
-    # based on sizes from https://gist.github.com/TomNicholas/c6a28f7c22c6981f75bce280d3e28283
-    spec = cubed.Spec(tmp_path, allowed_mem="2GB", reserved_mem="100MB")
-    u = cubed.random.random((t_length, 1, 987, 1920), chunks=(10, 1, -1, -1), spec=spec)
-    v = cubed.random.random((t_length, 1, 987, 1920), chunks=(10, 1, -1, -1), spec=spec)
-    uv = u * v
-    m = xp.mean(uv, axis=0)
-    return m
-
-
-def test_quad_means(tmp_path):
-    t_length = 50
-
-    # run twice, with and without optimization
-    # set the random seed to ensure deterministic results
-    random.seed(42)
-    m0 = quad_means(tmp_path, t_length)
-
-    random.seed(42)
-    m1 = quad_means(tmp_path, t_length)
-
-    m1.visualize(
-        filename=tmp_path / "quad_means", optimize_function=fuse_all_optimize_dag
-    )
-
-    cubed.to_zarr(m0, store=tmp_path / "result0")
-    cubed.to_zarr(
-        m1, store=tmp_path / "result1", optimize_function=fuse_all_optimize_dag
-    )
-
-    res0 = open_storage_array(tmp_path / "result0", mode="r")
-    res1 = open_storage_array(tmp_path / "result1", mode="r")
-
-    assert_array_equal(res0[:], res1[:])
-
-
-def test_quad_means_zarr(tmp_path):
-    t_length = 50
-
-    # write inputs to Zarr first to test more realistic usage pattern
-    spec = cubed.Spec(tmp_path, allowed_mem="2GB", reserved_mem="100MB")
-    u = cubed.random.random((t_length, 1, 987, 1920), chunks=(10, 1, -1, -1), spec=spec)
-    v = cubed.random.random((t_length, 1, 987, 1920), chunks=(10, 1, -1, -1), spec=spec)
-
-    arrays = [u, v]
-    paths = [f"{tmp_path}/u_{t_length}.zarr", f"{tmp_path}/v_{t_length}.zarr"]
-    cubed.store(arrays, paths)
-
-    u = cubed.from_zarr(f"{tmp_path}/u_{t_length}.zarr", spec=spec)
-    v = cubed.from_zarr(f"{tmp_path}/v_{t_length}.zarr", spec=spec)
-    uv = u * v
-    m = xp.mean(uv, axis=0, split_every=10)
-
-    opt_fn = partial(multiple_inputs_optimize_dag, max_total_num_input_blocks=40)
-
-    m.visualize(filename=tmp_path / "quad_means", optimize_function=opt_fn)
-
-    cubed.to_zarr(m, store=tmp_path / "result", optimize_function=opt_fn)
-
-
-def sqrts(x):
-    if x.dtype not in _floating_dtypes:
-        raise TypeError("Only floating-point dtypes are allowed in sqrts")
-
-    def _sqrts(x):
-        yield nxp.sqrt(x)
-        yield -nxp.sqrt(x)
-
-    def back_key_function(out_key):
-        return FunctionArgs(ChunkKey(x.name, out_key.coords), output_name=out_key.name)
-
-    return general_blockwise(
-        _sqrts,
-        back_key_function,
-        x,
-        shapes=[x.shape, x.shape],
-        dtypes=[x.dtype, x.dtype],
-        chunkss=[x.chunks, x.chunks],
-        target_stores=[None, None],  # filled in by general_blockwise
-    )
-
-
-def test_multiple_outputs():
-    a = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], chunks=(2, 2), dtype=float)
-    b, c = sqrts(a)
-
-    cubed.compute(b, c)
-
-    input = np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]])
-    assert_array_equal(b, np.sqrt(input))
-    assert_array_equal(c, -np.sqrt(input))

@@ -1,19 +1,15 @@
-from collections.abc import Iterable
 from numbers import Integral
+from typing import Iterable
+
+import numpy as np
 
 from cubed.array_api.data_type_functions import result_type
 from cubed.array_api.dtypes import _numeric_dtypes
-from cubed.array_api.manipulation_functions import (
-    broadcast_arrays,
-    expand_dims,
-    moveaxis,
-)
-from cubed.backend_array_api import namespace as nxp
+from cubed.array_api.manipulation_functions import expand_dims
 from cubed.core import blockwise, reduction, squeeze
-from cubed.vendor.dask.array.utils import validate_axis
 
 
-def matmul(x1, x2, /, split_every=None):
+def matmul(x1, x2, /):
     if x1.dtype not in _numeric_dtypes or x2.dtype not in _numeric_dtypes:
         raise TypeError("Only numeric dtypes are allowed in matmul")
 
@@ -35,11 +31,6 @@ def matmul(x1, x2, /, split_every=None):
     elif x1.ndim > x2.ndim:
         x2 = expand_dims(x2, tuple(range(x1.ndim - x2.ndim)))
 
-    if x1.shape[-1] != x2.shape[-2]:
-        raise ValueError(
-            f"matmul: dimension mismatch, x1.shape[-1]={x1.shape[-1]}, x2.shape[-2]={x2.shape[-2]}"
-        )
-
     out_ind = tuple(range(x1.ndim + 1))
     x1_ind = tuple(range(x1.ndim))
     x2_ind = tuple(range(x1.ndim - 2)) + (x1_ind[-1], x1.ndim)
@@ -57,7 +48,7 @@ def matmul(x1, x2, /, split_every=None):
         dtype=dtype,
     )
 
-    out = _sum_wo_cat(out, axis=-2, dtype=dtype, split_every=split_every)
+    out = _sum_wo_cat(out, axis=-2, dtype=dtype)
 
     if x1_is_1d:
         out = squeeze(out, -2)
@@ -68,27 +59,19 @@ def matmul(x1, x2, /, split_every=None):
 
 
 def _matmul(a, b):
-    chunk = nxp.matmul(a, b)
-    return chunk[..., nxp.newaxis, :]
+    chunk = np.matmul(a, b)
+    return chunk[..., np.newaxis, :]
 
 
-def _sum_wo_cat(a, axis=None, dtype=None, split_every=None):
+def _sum_wo_cat(a, axis=None, dtype=None):
     if a.shape[axis] == 1:
         return squeeze(a, axis)
 
-    extra_func_kwargs = dict(dtype=dtype)
-    return reduction(
-        a,
-        _chunk_sum,
-        axis=axis,
-        dtype=dtype,
-        split_every=split_every,
-        extra_func_kwargs=extra_func_kwargs,
-    )
+    return reduction(a, _chunk_sum, axis=axis, dtype=dtype)
 
 
 def _chunk_sum(a, axis=None, dtype=None, keepdims=None):
-    return nxp.sum(a, axis=axis, dtype=dtype, keepdims=True)
+    return np.sum(a, axis=axis, dtype=dtype, keepdims=True)
 
 
 def matrix_transpose(x, /):
@@ -102,7 +85,11 @@ def matrix_transpose(x, /):
     return permute_dims(x, axes)
 
 
-def tensordot(x1, x2, /, *, axes=2, split_every=None):
+def outer(x1, x2, /):
+    return blockwise(np.outer, "ij", x1, "i", x2, "j", dtype=x1.dtype)
+
+
+def tensordot(x1, x2, /, *, axes=2):
     from cubed.array_api.statistical_functions import sum
 
     if x1.dtype not in _numeric_dtypes or x2.dtype not in _numeric_dtypes:
@@ -123,9 +110,6 @@ def tensordot(x1, x2, /, *, axes=2, split_every=None):
         x1_axes = tuple(x1_axes)
     if isinstance(x2_axes, list):
         x2_axes = tuple(x2_axes)
-
-    x1_axes = validate_axis(x1_axes, x1.ndim)
-    x2_axes = validate_axis(x2_axes, x2.ndim)
 
     dtype = result_type(x1, x2)
 
@@ -149,16 +133,11 @@ def tensordot(x1, x2, /, *, axes=2, split_every=None):
         adjust_chunks=adjust_chunks,
         axes=(x1_axes, x2_axes),
     )
-    return sum(
-        out,
-        axis=x1_axes,
-        dtype=dtype,
-        split_every=split_every,
-    )
+    return sum(out, axis=x1_axes, dtype=dtype)
 
 
 def _tensordot(a, b, axes):
-    x = nxp.tensordot(a, b, axes=axes)
+    x = np.tensordot(a, b, axes=axes)
     ind = [slice(None, None)] * x.ndim
     for a in sorted(axes[0]):
         ind.insert(a, None)
@@ -166,21 +145,7 @@ def _tensordot(a, b, axes):
     return x
 
 
-def vecdot(x1, x2, /, *, axis=-1, split_every=None):
-    # based on the implementation in array-api-compat
+def vecdot(x1, x2, /, *, axis=-1):
     if x1.dtype not in _numeric_dtypes or x2.dtype not in _numeric_dtypes:
         raise TypeError("Only numeric dtypes are allowed in vecdot")
-
-    if x1.shape[axis] != x2.shape[axis]:
-        raise ValueError("x1 and x2 must have the same size along the given axis")
-
-    x1_ = moveaxis(x1, axis, -1)
-    x2_ = moveaxis(x2, axis, -1)
-    x1_, x2_ = broadcast_arrays(x1_, x2_)
-
-    res = matmul(
-        x1_[..., None, :],
-        x2_[..., None],
-        split_every=split_every,
-    )
-    return res[..., 0, 0]
+    return tensordot(x1, x2, axes=((axis,), (axis,)))

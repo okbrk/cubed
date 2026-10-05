@@ -39,20 +39,18 @@ This example shows how the `squeeze` operation is implemented using `map_blocks`
 
 ![The map_blocks core operation](images/map_blocks.svg)
 
-## `map_selection`
+## `map_direct`
 
-The `map_selection` operation selects subsets of an input array using standard NumPy indexing notation.
+The `map_direct` operation is more general than `map_blocks` since it allows input arrays to be read directly, without regard for block boundaries.
 
 * No input array attributes are preserved in general
-* __Single__ input, __single__ output
+* __Multiple__ inputs, __single__ output
 
-It is a core operation that is implemented using `blockwise` on the output's blocks. It works by converting indexing selections, such as slices, to keys that refer to blocks in the input array, then retrieving these blocks, slicing them, and assembling them into the final output block.
+It is a core operation that is implemented using `map_blocks`, which is in turn implemented using `blockwise`. It works by creating an empty array that has the same shape and chunk structure as the output, and calling `map_blocks` on this empty array, passing in the input arrays as side inputs to the function, which may access them in whatever way is needed.
 
-This example shows how `index` is implemented using `map_selection`. Each block in the output array is read directly from one or more blocks from the inputs.
+This example shows how `concat` is implemented using `map_direct`. Each block in the output array is read directly from one or more blocks from the inputs.
 
-![The map_selection core operation](images/map_selection.svg)
-
-Note: previously, operations that now use `map_selection` were written using `map_direct`, which allowed input arrays to be read directly. The main difference between the two operations is that `map_selection` tracks which blocks are read by the operation, which allows the optimizer to fuse operations. This is unlike `map_direct`, which does not provide information about block inputs, and therefore cannot be fused by the optimizer.
+![The map_direct core operation](images/map_direct.svg)
 
 ## `blockwise`
 
@@ -64,13 +62,6 @@ The `blockwise` operation is a primitive operation that operates on input array 
 This example shows how `outer` is implemented using `blockwise`. Each block from the input is sent to three blocks in the output. (Arrows are only shown for two input blocks, in order to avoid cluttering the diagram.)
 
 ![The blockwise primitive operation](images/blockwise.svg)
-
-Note: the `general_blockwise` operation is a more general form of `blockwise` that uses a function to specify the block mapping, rather than an index notation, and which supports multiple outputs.
-
-* No input array attributes are preserved in general
-* __Multiple__ inputs, __multiple__ outputs
-
-For multiple outputs, all output arrays must have matching `numblocks`.
 
 (rechunk-operation)=
 ## `rechunk`
@@ -91,11 +82,10 @@ The `reduction` operation reduces an array along one or more axes.
 * No input array attributes are preserved in general
 * __Single__ input, __single__ output
 
-It is a core operation that is implemented using a `blockwise` operation called `partial_reduce` that reads multiple blocks and performs the reduction operation on them.
-The `partial_reduce` operations are arranged in a tree (`tree_reduce`) with multiple rounds until there's a single block in each reduction axis. Finally an aggregate `blockwise` operation is applied to the results.
+It is a core operation that is implemented using repeated calls to `blockwise` and `rechunk`.
 
-Here is an example of reducing over the first axis, with two rounds of `partial_reduce` operations:
+Here is an example of reducing over the first axis, with a single round of `rechunk` and `combine` - in general there would be multiple rounds until there's a single block in each reduction axis.
 
-![The reduction core operation](images/reduction_new.svg)
+![The reduction core operation](images/reduction.svg)
 
 The `arg_reduction` works similarly, but uses different functions to return indexes rather than values.

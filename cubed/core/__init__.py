@@ -1,5 +1,15 @@
 # flake8: noqa
-from .array import CoreArray, compute, gensym, measure_reserved_mem, visualize
+from .array import (
+    Callback,
+    CoreArray,
+    Spec,
+    TaskEndEvent,
+    compute,
+    gensym,
+    measure_reserved_mem,
+    measure_reserved_memory,
+    visualize,
+)
 from .gufunc import apply_gufunc
 from .ops import (
     blockwise,
@@ -9,7 +19,6 @@ from .ops import (
     map_blocks,
     rechunk,
     reduction,
-    scan,
     squeeze,
     store,
     to_zarr,

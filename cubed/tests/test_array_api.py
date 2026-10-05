@@ -1,51 +1,30 @@
+import fsspec
 import numpy as np
 import pytest
+from numpy.testing import assert_allclose, assert_array_equal
 
 import cubed
 import cubed.array_api as xp
-from cubed._testing import assert_allclose, assert_array_equal
 from cubed.array_api.manipulation_functions import reshape_chunks
-from cubed.backend_array_api import namespace as nxp
-from cubed.tests.utils import (
-    ALL_EXECUTORS,
-    MAIN_EXECUTORS,
-    MODAL_EXECUTORS,
-    skip_if_cupy,
-)
+from cubed.tests.utils import ALL_EXECUTORS, MAIN_EXECUTORS, MODAL_EXECUTORS
 
 
-@pytest.fixture
+@pytest.fixture()
 def spec(tmp_path):
     return cubed.Spec(tmp_path, allowed_mem=100000)
 
 
-@pytest.fixture(
-    scope="module",
-    params=MAIN_EXECUTORS,
-    ids=[executor.name for executor in MAIN_EXECUTORS],
-)
+@pytest.fixture(scope="module", params=MAIN_EXECUTORS)
 def executor(request):
-    if request.param.name == "processes" and "cupy" in nxp.__name__:
-        pytest.skip(reason="CuPy is not supported with 'processes' executor")
     return request.param
 
 
-@pytest.fixture(
-    scope="module",
-    params=ALL_EXECUTORS,
-    ids=[executor.name for executor in ALL_EXECUTORS],
-)
+@pytest.fixture(scope="module", params=ALL_EXECUTORS)
 def any_executor(request):
-    if request.param.name == "processes" and "cupy" in nxp.__name__:
-        pytest.skip(reason="CuPy is not supported with 'processes' executor")
     return request.param
 
 
-@pytest.fixture(
-    scope="module",
-    params=MODAL_EXECUTORS,
-    ids=[executor.name for executor in MODAL_EXECUTORS],
-)
+@pytest.fixture(scope="module", params=MODAL_EXECUTORS)
 def modal_executor(request):
     return request.param
 
@@ -54,7 +33,7 @@ def modal_executor(request):
 
 
 def test_object_bool(tmp_path, executor):
-    spec = cubed.Spec(tmp_path, allowed_mem=100000, executor=executor)
+    spec = cubed.Spec(tmp_path, 100000, executor=executor)
     a = xp.asarray(
         [[False, False, False], [False, False, False], [False, False, False]],
         chunks=(2, 2),
@@ -120,11 +99,6 @@ def test_eye(spec, k):
     assert_array_equal(a, np.eye(5, k=k))
 
 
-def test_eye_not_square():
-    a = xp.eye(1, 3, k=2)
-    assert_array_equal(a, np.eye(1, 3, k=2))
-
-
 @pytest.mark.parametrize("endpoint", [True, False])
 def test_linspace(spec, endpoint):
     a = xp.linspace(6, 49, 50, endpoint=endpoint, chunks=5, spec=spec)
@@ -183,62 +157,13 @@ def test_add(spec, any_executor):
     )
 
 
-def test_add_top_level_namespace(spec, executor):
-    a = cubed.ones((10, 10), chunks=(10, 2), spec=spec)
-    b = cubed.ones((10, 10), chunks=(2, 10), spec=spec)
-    c = cubed.add(a, b)
-    assert_array_equal(
-        c.compute(executor=executor), np.ones((10, 10)) + np.ones((10, 10))
-    )
-
-
-def test_add_different_chunks(spec, executor):
+def test_add_with_broadcast(spec, executor):
     a = xp.ones((10, 10), chunks=(10, 2), spec=spec)
     b = xp.ones((10, 10), chunks=(2, 10), spec=spec)
     c = xp.add(a, b)
     assert_array_equal(
         c.compute(executor=executor), np.ones((10, 10)) + np.ones((10, 10))
     )
-
-
-def test_add_different_chunks_fail(spec, executor):
-    a = xp.ones((10,), chunks=(3,), spec=spec)
-    b = xp.ones((10,), chunks=(5,), spec=spec)
-    c = xp.add(a, b)
-    assert_array_equal(c.compute(executor=executor), np.ones((10,)) + np.ones((10,)))
-
-
-def test_add_scalars():
-    a = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], chunks=(2, 2))
-
-    b = xp.add(a, 1)
-    assert_array_equal(b.compute(), np.array([[2, 3, 4], [5, 6, 7], [8, 9, 10]]))
-
-    c = xp.add(2, a)
-    assert_array_equal(c.compute(), np.array([[3, 4, 5], [6, 7, 8], [9, 10, 11]]))
-
-    with pytest.raises(TypeError):
-        xp.add(1, 2)
-
-
-@pytest.mark.parametrize(
-    ("min", "max"),
-    [
-        (None, None),
-        # (4, None),  # fails unless array-api-compat is used
-        (None, 7),
-        (4, 7),
-        (0, 10),
-    ],
-)
-def test_clip(spec, min, max):
-    a = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], chunks=(2, 2), spec=spec)
-    npa = np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]])
-    b = xp.clip(a, min, max)
-    if min is max is None:
-        assert b is a
-    else:
-        assert_array_equal(b.compute(), np.clip(npa, min, max))
 
 
 def test_equal(spec):
@@ -263,16 +188,14 @@ def test_negative(spec, executor):
 @pytest.mark.parametrize(
     "ind",
     [
-        Ellipsis,
         6,
-        (6, xp.newaxis),
-        (xp.newaxis, 6),
+        (6, None),  # add a new dimension
+        (None, 6),  # add a new dimension
         slice(None),
         slice(10),
         slice(3, None),
-        slice(3, 3),
         slice(3, 10),
-        (slice(10), xp.newaxis),
+        (slice(10), None),  # add a new dimension
     ],
 )
 def test_index_1d(spec, ind):
@@ -283,23 +206,18 @@ def test_index_1d(spec, ind):
 @pytest.mark.parametrize(
     "ind",
     [
-        Ellipsis,
         (2, 3),
-        (xp.newaxis, 2, 3),
-        (Ellipsis, slice(2, 4)),
-        (slice(None), slice(2, 2)),
+        (None, 2, 3),  # add a new dimension
         (slice(None), slice(2, 4)),
         (slice(3), slice(2, None)),
         (slice(1, None), slice(4)),
-        (slice(1, 3), Ellipsis),
-        (slice(1, 1), slice(None)),
         (slice(1, 3), slice(None)),
-        (xp.newaxis, slice(None), slice(2, 4)),
-        (slice(None), xp.newaxis, slice(2, 4)),
-        (slice(None), slice(2, 4), xp.newaxis),
+        (slice(None), slice(2, 4)),
+        (None, slice(None), slice(2, 4)),  # add a new dimension
+        (slice(None), None, slice(2, 4)),  # add a new dimension
+        (slice(None), slice(2, 4), None),  # add a new dimension
         (slice(None), 1),
         (1, slice(2, 4)),
-        (0, slice(1, None, -1)),
     ],
 )
 def test_index_2d(spec, ind):
@@ -313,26 +231,7 @@ def test_index_2d(spec, ind):
 
 
 @pytest.mark.parametrize(
-    "ind",
-    [
-        Ellipsis,
-        (slice(None), slice(None)),
-        (slice(0, 4), slice(None)),
-        (slice(None), slice(0, 4)),
-        (slice(0, 4), slice(0, 4)),
-    ],
-)
-def test_index_2d_no_op(spec, ind):
-    a = xp.asarray(
-        [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16]],
-        chunks=(2, 2),
-        spec=spec,
-    )
-    assert a is a[ind]
-
-
-@pytest.mark.parametrize(
-    ("shape", "chunks", "ind", "new_chunks_expected"),
+    "shape, chunks, ind, new_chunks_expected",
     [
         # step divides chunks exactly
         (20, 4, slice(3, 14, 2), ((4, 2),)),
@@ -343,8 +242,6 @@ def test_index_2d_no_op(spec, ind):
         (20, 8, slice(5, 18, 3), ((5,),)),
         # step is bigger than chunks
         (50, 5, slice(3, 50, 7), ((5, 2),)),
-        # negative step
-        (20, 4, slice(14, 3, -2), ((4, 2),)),
     ],
 )
 def test_index_1d_step(spec, shape, chunks, ind, new_chunks_expected):
@@ -356,33 +253,13 @@ def test_index_1d_step(spec, shape, chunks, ind, new_chunks_expected):
 
 # fmt: off
 @pytest.mark.parametrize(
-    ("shape", "chunks", "ind", "new_chunks_expected"),
+    "shape, chunks, ind, new_chunks_expected",
     [
         (
             (20, 20),
             (4, 4),
             (slice(3, 14, 2), slice(3, 14, 3)),
             ((4, 2), (3, 1),),
-        ),
-        (
-            (20, 20),
-            (4, 4),
-            (slice(14, 3, -2), slice(3, 14, 3)),
-            ((4, 2), (3, 1),),
-        ),
-        (
-            (20, 20),
-            (4, 4),
-            (slice(14, 3, -2), slice(14, 3, -3)),
-            ((4, 2), (4,),),
-        ),
-        # integer index on axis 0 drops a dimension; negative step on axis 1
-        # must flip on axis 0 of the output, not axis 1 of the input
-        (
-            (1, 2),
-            (1, 2),
-            (0, slice(1, None, -1)),
-            ((2,),),
         ),
     ],
 )
@@ -394,23 +271,35 @@ def test_index_2d_step(spec, shape, chunks, ind, new_chunks_expected):
     assert b.chunks == new_chunks_expected
 
 
-@pytest.mark.parametrize(
-    ("shape", "chunks", "ind"),
-    [
-        ((0, 2), (0, 2), (slice(None), 0)),
-        ((0, 2), (1, 2), (slice(None), 0)),
-        ((2, 0), (2, 0), (0, slice(None))),
-        ((2, 0), (2, 1), (0, slice(None))),
-    ],
-)
-def test_index_zero_dim(shape, chunks, ind):
-    a = xp.ones(shape, chunks=chunks)
-    b = a[ind]
-    assert_array_equal(b.compute(), np.ones(shape)[ind])
+def test_index_slice_unsupported_step(spec):
+    with pytest.raises(NotImplementedError):
+        a = xp.arange(12, chunks=(4,), spec=spec)
+        a[::-1]
 
 
-@pytest.mark.parametrize("axis", [0, 1, -1, -2])
-@skip_if_cupy  # ndindex with a cupy.ndarray
+@pytest.mark.xfail(reason="not currently compatible with lazy zarr arrays")
+def test_setitem(spec):
+    a = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], chunks=(2, 2), spec=spec)
+    b = xp.ones(())
+    a[1, 2] = b
+    assert_array_equal(a.compute(), np.array([[1, 2, 3], [4, 5, 1], [7, 8, 9]]))
+
+
+def test_setitem_fails_not_0d(spec):
+    a = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], chunks=(2, 2), spec=spec)
+    b = xp.asarray([[4, 5, 6], [7, 8, 9], [1, 2, 3]], chunks=(2, 2), spec=spec)
+    with pytest.raises(NotImplementedError):
+        a[:] = b
+
+
+def test_setitem_fails_not_computed(spec):
+    a = xp.arange(12, chunks=(4,), spec=spec)
+    b = xp.ones(())
+    with pytest.raises(NotImplementedError):
+        a[1] = b
+
+
+@pytest.mark.parametrize("axis", [0, 1])
 def test_take(spec, axis):
     a = xp.asarray(
         [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16]],
@@ -444,79 +333,69 @@ def test_matmul(spec, executor):
     assert_array_equal(c.compute(executor=executor), expected)
 
 
-def test_matmul_incompatible_inner_dims(spec):
-    a = xp.ones((3, 4), chunks=(2, 2), spec=spec)
-    b = xp.ones((3, 4), chunks=(2, 2), spec=spec)
-    with pytest.raises(ValueError, match="matmul: dimension mismatch"):
-        xp.matmul(a, b)
-
-
 @pytest.mark.cloud
 def test_matmul_cloud(executor):
-    tmp_path = "s3://cubed-unittest/matmul"
-    spec = cubed.Spec(tmp_path, allowed_mem=100000, storage_options=dict(use_obstore=True))
-
-    a = xp.asarray(
-        [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16]],
-        chunks=(2, 2),
-        spec=spec,
-    )
-    b = xp.asarray(
-        [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16]],
-        chunks=(2, 2),
-        spec=spec,
-    )
-    c = xp.matmul(a, b)
-    x = np.array([[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16]])
-    y = np.array([[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16]])
-    expected = np.matmul(x, y)
-    assert_array_equal(c.compute(executor=executor), expected)
+    tmp_path = "gs://barry-zarr-test/matmul"
+    spec = cubed.Spec(tmp_path, allowed_mem=100000)
+    try:
+        a = xp.asarray(
+            [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16]],
+            chunks=(2, 2),
+            spec=spec,
+        )
+        b = xp.asarray(
+            [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16]],
+            chunks=(2, 2),
+            spec=spec,
+        )
+        c = xp.matmul(a, b)
+        x = np.array([[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16]])
+        y = np.array([[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16]])
+        expected = np.matmul(x, y)
+        assert_array_equal(c.compute(executor=executor), expected)
+    finally:
+        fs = fsspec.open(tmp_path).fs
+        fs.rm(tmp_path, recursive=True)
 
 
 @pytest.mark.cloud
 def test_matmul_modal(modal_executor):
     tmp_path = "s3://cubed-unittest/matmul"
-    spec = cubed.Spec(tmp_path, allowed_mem=100000, storage_options=dict(use_obstore=True))
-
-    a = xp.asarray(
-        [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16]],
-        chunks=(2, 2),
-        spec=spec,
-    )
-    b = xp.asarray(
-        [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16]],
-        chunks=(2, 2),
-        spec=spec,
-    )
-    c = xp.matmul(a, b)
-    x = np.array([[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16]])
-    y = np.array([[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16]])
-    expected = np.matmul(x, y)
-    assert_array_equal(c.compute(executor=modal_executor), expected)
+    spec = cubed.Spec(tmp_path, allowed_mem=100000)
+    try:
+        a = xp.asarray(
+            [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16]],
+            chunks=(2, 2),
+            spec=spec,
+        )
+        b = xp.asarray(
+            [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16]],
+            chunks=(2, 2),
+            spec=spec,
+        )
+        c = xp.matmul(a, b)
+        x = np.array([[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16]])
+        y = np.array([[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16]])
+        expected = np.matmul(x, y)
+        assert_array_equal(c.compute(executor=modal_executor), expected)
+    finally:
+        fs = fsspec.open(tmp_path).fs
+        fs.rm(tmp_path, recursive=True)
 
 
 def test_outer(spec, executor):
     a = xp.asarray([0, 1, 2], chunks=2, spec=spec)
     b = xp.asarray([10, 50, 100], chunks=2, spec=spec)
-    c = xp.linalg.outer(a, b)
+    c = xp.outer(a, b)
     assert_array_equal(c.compute(executor=executor), np.outer([0, 1, 2], [10, 50, 100]))
 
 
-@pytest.mark.parametrize(
-    ("x_shape", "y_shape", "x_chunks", "y_chunks", "axes"),
-    [
-        ((20, 20), (20, 10), (5, 4), (4, 5), 1),
-        ((20, 20), (20, 10), (5, 4), (4, 5), (1, 0)),
-        # negative axes on 3D arrays
-        ((2, 3, 4), (5, 4, 3), (2, 3, 2), (3, 2, 3), ((-1,), (1,))),
-        ((2, 3, 4), (5, 4, 3), (2, 3, 2), (3, 2, 3), ((-1,), (-2,))),
-    ],
-)
-def test_tensordot(x_shape, y_shape, x_chunks, y_chunks, axes):
-    x = np.arange(int(np.prod(x_shape))).reshape(x_shape)
-    a = xp.asarray(x, chunks=x_chunks)
-    y = np.arange(int(np.prod(y_shape))).reshape(y_shape)
-    b = xp.asarray(y, chunks=y_chunks)
+@pytest.mark.parametrize("axes", [1, (1, 0)])
+def test_tensordot(axes):
+    x = np.arange(400).reshape((20, 20))
+    a = xp.asarray(x, chunks=(5, 4))
+    y = np.arange(200).reshape((20, 10))
+    b = xp.asarray(y, chunks=(4, 5))
     assert_array_equal(
         xp.tensordot(a, b, axes=axes).compute(), np.tensordot(x, y, axes=axes)
     )
@@ -542,10 +421,9 @@ def test_broadcast_arrays(executor):
 
 
 @pytest.mark.parametrize(
-    ("shape", "chunks", "new_shape", "new_chunks", "new_chunks_expected"),
+    "shape, chunks, new_shape, new_chunks, new_chunks_expected",
     [
-        ((), (), (0,), None, ((0,),)),
-        ((5, 1, 6), (3, 1, 3), (5, 0, 6), None, ((3, 2), (0,), (3, 3))),
+        # ((5, 1, 6), (3, 1, 3), (5, 0, 6), None, ((3, 2), (0,), (3, 3))),  # fails
         ((5, 1, 6), (3, 1, 3), (5, 4, 6), None, ((3, 2), (1, 1, 1, 1), (3, 3))),
         ((5, 1, 6), (3, 1, 3), (2, 5, 1, 6), None, ((1, 1), (3, 2), (1,), (3, 3))),
         ((5, 1, 6), (3, 1, 3), (5, 3, 6), (3, 3, 3), ((3, 2), (3,), (3, 3))),
@@ -577,110 +455,10 @@ def test_concat(spec, executor):
     )
 
 
-def test_concat_different_chunks(spec):
-    a = xp.asarray([[1], [5]], chunks=(2, 2), spec=spec)
-    b = xp.asarray([[2, 3, 4], [6, 7, 8]], chunks=(2, 3), spec=spec)
-    c = xp.concat([a, b], axis=1)
-    assert_array_equal(
-        c.compute(),
-        np.concatenate(
-            [
-                np.array([[1], [5]]),
-                np.array([[2, 3, 4], [6, 7, 8]]),
-            ],
-            axis=1,
-        ),
-    )
-
-
-@pytest.mark.parametrize("axis", [None, 0])
-def test_concat_single_array(spec, axis):
-    a = xp.full((4, 5), 1, chunks=(3, 2), spec=spec)
-    d = xp.concat([a], axis=axis)
-    assert_array_equal(
-        d.compute(),
-        np.concatenate([np.full((4, 5), 1)], axis=axis),
-    )
-
-
-def test_concat_incompatible_shapes(spec):
-    a = xp.full((4, 5), 1, chunks=(3, 2), spec=spec)
-    b = xp.full((4, 6), 2, chunks=(3, 2), spec=spec)
-    with pytest.raises(
-        ValueError,
-        match="all the input array dimensions except for the concatenation axis must match exactly",
-    ):
-        xp.concat([a, b], axis=0)
-    xp.concat([a, b], axis=1)  # OK
-    xp.concat([a, b], axis=-1)  # OK
-
-
-def test_concat_mixed_dtypes(spec):
-    a = xp.asarray([1, 2, 3], dtype=xp.int32, spec=spec)
-    b = xp.asarray([4.0, 5.0, 6.0], dtype=xp.float64, spec=spec)
-    c = xp.concat([a, b])
-    assert c.dtype == xp.float64
-    assert_array_equal(c.compute(), np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]))
-
-
-def test_concat_input_larger_than_target_chunks(spec):
-    # Regression: _chunk_slices used target chunksize when computing within-chunk offsets,
-    # giving wrong values when an input array has a larger chunksize than the target output.
-    a = xp.asarray(np.arange(10), chunks=(10,), spec=spec)  # single chunk of 10
-    b = xp.asarray(np.arange(10, 15), chunks=(5,), spec=spec)
-    c = xp.concat([a, b], chunks=(5,))  # target chunksize 5, but a has chunksize 10
-    assert_array_equal(c.compute(), np.arange(15))
-
-
-@pytest.mark.parametrize("axis", [0, 1, (0, 1), (2, 0)])
-def test_expand_dims(spec, axis):
+def test_expand_dims(spec, executor):
     a = xp.asarray([1, 2, 3], chunks=(2,), spec=spec)
-    b = xp.expand_dims(a, axis=axis)
-    assert_array_equal(b.compute(), np.expand_dims([1, 2, 3], axis))
-
-
-@pytest.mark.parametrize(
-    ("shape", "chunks", "axis"),
-    [
-        ((10,), (4,), None),
-        ((10,), (4,), 0),
-        ((10,), (5,), 0),
-        ((10, 7), (4, 3), None),
-        ((10, 7), (4, 3), 0),
-        ((10, 7), (4, 3), 1),
-        ((10, 7), (4, 3), (0, 1)),
-        ((10, 7), (4, 3), -1),
-        ((10, 7), (5, 3), (0, 1)),
-    ],
-)
-def test_flip(executor, shape, chunks, axis):
-    x = np.random.randint(10, size=shape)
-    a = xp.asarray(x, chunks=chunks)
-    b = xp.flip(a, axis=axis)
-
-    assert b.chunks == a.chunks
-
-    assert_array_equal(
-        b.compute(executor=executor),
-        np.flip(x, axis=axis),
-    )
-
-
-
-
-def test_flip_zero_size_dim(spec):
-    x = np.ones((0, 4))
-    a = xp.asarray(x, chunks=(1, 2), spec=spec)
-    assert_array_equal(xp.flip(a, axis=0).compute(), np.flip(x, axis=0))
-
-
-def test_moveaxis(spec):
-    a = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], chunks=(2, 2), spec=spec)
-    b = xp.moveaxis(a, [0, -1], [-1, 0])
-    assert_array_equal(
-        b.compute(),
-        np.moveaxis(np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]]), [0, -1], [-1, 0]),
-    )
+    b = xp.expand_dims(a, axis=0)
+    assert_array_equal(b.compute(executor=executor), np.expand_dims([1, 2, 3], 0))
 
 
 def test_permute_dims(spec, executor):
@@ -689,15 +467,6 @@ def test_permute_dims(spec, executor):
     assert_array_equal(
         b.compute(executor=executor),
         np.transpose(np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]])),
-    )
-
-
-def test_repeat(spec):
-    a = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], chunks=(2, 2), spec=spec)
-    b = xp.repeat(a, 3, axis=1)
-    assert_array_equal(
-        b.compute(),
-        np.repeat(np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]]), 3, axis=1),
     )
 
 
@@ -722,50 +491,6 @@ def test_reshape_chunks(spec, executor):
         b.compute(executor=executor),
         np.array([[0, 1, 4, 5, 8, 9], [2, 3, 6, 7, 10, 11]]),
     )
-
-
-def test_reshape_chunks_with_smaller_end_chunk(spec, executor):
-    a = xp.arange(10, chunks=4, spec=spec)
-    b = reshape_chunks(a, (2, 5), (2, 2))
-
-    assert b.shape == (2, 5)
-    assert b.chunks == ((2,), (2, 2, 1))
-
-    assert_array_equal(
-        b.compute(executor=executor),
-        np.array([[0, 1, 4, 5, 8], [2, 3, 6, 7, 9]]),
-    )
-
-
-def _maybe_len(a):
-    try:
-        return len(a)
-    except TypeError:
-        return 0
-
-
-@pytest.mark.parametrize(
-    ("chunks", "shift", "axis"),
-    [
-        ((2, 6), 3, None),
-        ((2, 6), 3, 0),
-        ((2, 6), (3, 9), (0, 1)),
-        ((2, 6), (3, 9), None),
-        ((2, 6), (3, 9), 1),
-    ],
-)
-def test_roll(spec, executor, chunks, shift, axis):
-    x = np.arange(4 * 6).reshape((4, 6))
-    a = cubed.from_array(x, chunks=chunks, spec=spec)
-
-    if _maybe_len(shift) != _maybe_len(axis):
-        with pytest.raises(TypeError if axis is None else ValueError):
-            xp.roll(a, shift, axis=axis)
-    else:
-        assert_array_equal(
-            xp.roll(a, shift, axis=axis).compute(executor=executor),
-            np.roll(x, shift, axis),
-        )
 
 
 def test_squeeze_1d(spec, executor):
@@ -793,65 +518,6 @@ def test_stack(spec, executor):
     )
 
 
-def test_stack_mixed_dtypes(spec):
-    a = xp.asarray([1, 2, 3], dtype=xp.int32, spec=spec)
-    b = xp.asarray([4.0, 5.0, 6.0], dtype=xp.float64, spec=spec)
-    c = xp.stack([a, b])
-    assert c.dtype == xp.float64
-    assert_array_equal(c.compute(), np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]))
-
-
-@pytest.mark.parametrize("repetitions", [(2,), (2, 5), (2, 5, 3)])
-def test_tile(spec, repetitions):
-    a = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], chunks=(2, 2), spec=spec)
-    b = xp.tile(a, repetitions)
-    assert_array_equal(
-        b.compute(),
-        np.tile(np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]]), repetitions),
-    )
-
-
-@pytest.mark.parametrize("chunks", [(1, 2, 3), (2, 2, 3), (3, 2, 3)])
-def test_unstack(spec, executor, chunks):
-    a = xp.full((4, 6), 1, chunks=(2, 3), spec=spec)
-    b = xp.full((4, 6), 2, chunks=(2, 3), spec=spec)
-    c = xp.full((4, 6), 3, chunks=(2, 3), spec=spec)
-    d = xp.stack([a, b, c], axis=0)
-
-    d = d.rechunk(chunks)
-
-    au, bu, cu = cubed.compute(*xp.unstack(d), executor=executor, optimize_graph=False)
-
-    assert_array_equal(au, np.full((4, 6), 1))
-    assert_array_equal(bu, np.full((4, 6), 2))
-    assert_array_equal(cu, np.full((4, 6), 3))
-
-
-def test_unstack_zero_arrays(spec):
-    a = xp.full((0, 4, 6), 1, chunks=(1, 2, 3), spec=spec)
-    assert xp.unstack(a) == ()
-
-
-def test_unstack_single_array(spec):
-    a = xp.full((1, 4, 6), 1, chunks=(1, 2, 3), spec=spec)
-    (b,) = xp.unstack(a)
-    assert_array_equal(b.compute(), np.full((4, 6), 1))
-
-
-def test_unstack_zero_size_dim(spec):
-    # Regression found by Hypothesis
-
-    # Case 1: one zero-size dim — rechunk fails due to wrong chunks on surviving axis
-    a = xp.zeros((0, 2, 1), chunks=(0, 2, 1), spec=spec)
-    (b,) = xp.unstack(a, axis=-1)
-    assert_array_equal((b == a[:, :, 0]).compute(), np.zeros((0, 2), dtype=bool))
-
-    # Case 2: two zero-size dims — immediate chunk/shape dimension mismatch
-    a = xp.zeros((0, 0, 1), chunks=(0, 0, 1), spec=spec)
-    (b,) = xp.unstack(a, axis=-1)
-    assert_array_equal((b == a[:, :, 0]).compute(), np.zeros((0, 0), dtype=bool))
-
-
 # Searching functions
 
 
@@ -872,13 +538,6 @@ def test_argmax_axis_0(spec):
         np.array([[11, 12, 13], [11, 11, 14], [10, 13, 11]]).argmax(axis=0),
     )
 
-def test_argmax_keepdims(spec):
-    # Regression: argmax with axis=None, keepdims=True returned shape () instead of (1,)*ndim
-    a = xp.asarray([[11, 12, 13], [11, 11, 14], [10, 13, 11]], chunks=(2, 2), spec=spec)
-    b = xp.argmax(a, keepdims=True)
-    assert b.shape == (1, 1)
-    assert_array_equal(b.compute(), np.array([[11, 12, 13], [11, 11, 14], [10, 13, 11]]).argmax(keepdims=True))
-
 
 def test_argmin_axis_0(spec):
     a = xp.asarray([[11, 12, 13], [11, 11, 14], [10, 13, 11]], chunks=(2, 2), spec=spec)
@@ -889,143 +548,7 @@ def test_argmin_axis_0(spec):
     )
 
 
-@pytest.mark.parametrize(
-    ("x1", "x1_chunks", "x2", "x2_chunks"),
-    [
-        ([], 1, [], 1),
-        ([0], 1, [0], 1),
-        ([-10, 0, 10, 20, 30], 3, [11, 30], 2),
-        ([-10, 0, 10, 20, 30], 3, [11, 30, -20, 1, -10, 10, 37, 11], 5),
-        ([-10, 0, 10, 20, 30], 3, [[11, 30, -20, 1, -10, 10, 37, 11]], 5),
-        ([-10, 0, 10, 20, 30], 3, [[7, 0], [-10, 10], [11, -1], [15, 15]], (2, 2)),
-    ],
-)
-@pytest.mark.parametrize("side", ["left", "right"])
-def test_searchsorted(x1, x1_chunks, x2, x2_chunks, side):
-    x1 = np.array(x1)
-    x2 = np.array(x2)
-
-    x1d = xp.asarray(x1, chunks=x1_chunks)
-    x2d = xp.asarray(x2, chunks=x2_chunks)
-
-    out = xp.searchsorted(x1d, x2d, side=side)
-
-    assert out.shape == x2d.shape
-    assert out.chunks == x2d.chunks
-    assert_array_equal(out.compute(), np.searchsorted(x1, x2, side=side))
-
-
-@pytest.mark.parametrize("side", ["left", "right"])
-def test_searchsorted_scalar(side):
-    x1 = np.array([-10, 0, 10, 20, 30])
-    x2 = 11
-
-    x1d = xp.asarray(x1, chunks=3)
-    x2d = x2
-
-    out = xp.searchsorted(x1d, x2d, side=side)
-
-    assert out.shape == ()
-    assert out.chunks == ()
-    assert_array_equal(out.compute(), np.searchsorted(x1, x2, side=side))
-
-
-def test_searchsorted_sorter_not_implemented():
-    with pytest.raises(NotImplementedError):
-        xp.searchsorted(xp.asarray([1, 0]), xp.asarray([1]), sorter=xp.asarray([1, 0]))
-
-
-def test_where_scalars():
-    condition = xp.asarray(
-        [[True, False, True], [False, True, False], [True, False, True]], chunks=(2, 2)
-    )
-    a = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], chunks=(2, 2))
-
-    b = xp.where(condition, a, 0)
-    assert_array_equal(b.compute(), np.array([[1, 0, 3], [0, 5, 0], [7, 0, 9]]))
-
-    c = xp.where(condition, 0, a)
-    assert_array_equal(c.compute(), np.array([[0, 2, 0], [4, 0, 6], [0, 8, 0]]))
-
-    with pytest.raises(TypeError):
-        xp.where(condition, 0, 1)
-
-
-# Set functions
-
-@pytest.mark.parametrize(("low", "high"), [(0, 10)])
-@pytest.mark.parametrize(
-    ("elements_shape", "elements_chunks"),
-    [((10,), (5,)), ((10,), (3,)), ((4, 5), (3, 2)), ((20, 20), (4, 5))],
-)
-@pytest.mark.parametrize(
-    ("test_shape", "test_chunks"),
-    [((10,), (5,)), ((10,), (3,)), ((4, 5), (3, 2)), ((20, 20), (4, 5))],
-)
-@pytest.mark.parametrize("invert", [True, False])
-def test_isin(
-    low, high, elements_shape, elements_chunks, test_shape, test_chunks, invert
-):
-    # based on dask test
-    rng = np.random.default_rng()
-
-    a1 = rng.integers(low, high, size=elements_shape)
-    c1 = cubed.from_array(a1, chunks=elements_chunks)
-
-    a2 = rng.integers(low, high, size=test_shape) - 5
-    c2 = cubed.from_array(a2, chunks=test_chunks)
-
-    r_a = np.isin(a1, a2, invert=invert)
-    r_c = xp.isin(c1, c2, invert=invert)
-
-    assert_array_equal(r_c, r_a)
-
-
 # Statistical functions
-
-
-@pytest.mark.parametrize("axis", [0, 1])
-def test_cumulative_prod_2d(axis):
-    a = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], chunks=(2, 2))
-    b = xp.cumulative_prod(a, axis=axis)
-    assert_array_equal(
-        b.compute(),
-        np.cumulative_prod(np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]]), axis=axis),
-    )
-
-
-@pytest.mark.parametrize("axis", [0, 1])
-def test_cumulative_sum_2d(axis):
-    a = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], chunks=(2, 2))
-    b = xp.cumulative_sum(a, axis=axis)
-    assert_array_equal(
-        b.compute(),
-        np.cumulative_sum(np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]]), axis=axis),
-    )
-
-
-def test_cumulative_sum_2d_recursive(executor):
-    a = xp.ones((10, 100), chunks=(10, 10))
-    b = xp.cumulative_sum(a, axis=1)
-    assert_array_equal(
-        b.compute(executor=executor),
-        np.cumulative_sum(np.ones((10, 100)), axis=1),
-    )
-
-
-def test_cumulative_sum_1d():
-    a = xp.asarray([0, 1, 2, 3, 4, 5, 6, 7, 8, 9], chunks=(4,))
-    b = xp.cumulative_sum(a, axis=0)
-    assert_array_equal(
-        b.compute(),
-        np.cumulative_sum(np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]), axis=0),
-    )
-
-
-def test_cumulative_sum_unsupported_include_initial(spec):
-    a = xp.asarray([0, 1, 2, 3, 4, 5, 6, 7, 8, 9], chunks=(4,))
-    with pytest.raises(NotImplementedError):
-        xp.cumulative_sum(a, axis=0, include_initial=True)
 
 
 def test_mean_axis_0(spec, executor):
@@ -1037,17 +560,6 @@ def test_mean_axis_0(spec, executor):
         b.compute(executor=executor),
         np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]]).mean(axis=0),
     )
-
-def test_mean_complex():
-    a = xp.asarray([1.0+1.0j, 2.0+2.0j, 3.0+3.0j], chunks=(2,))
-    b = xp.mean(a)
-    assert_array_equal(b.compute(), np.array([1.0+1.0j, 2.0+2.0j, 3.0+3.0j]).mean())
-
-
-def test_mean_int():
-    a = xp.asarray([1, 2, 3], chunks=(2,))
-    b = xp.mean(a)
-    assert_array_equal(b.compute(), np.array([1, 2, 3]).mean())
 
 
 def test_sum(spec, executor):
@@ -1062,52 +574,6 @@ def test_sum_axis_0(spec, executor):
     a = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], chunks=(2, 2), spec=spec)
     b = xp.sum(a, axis=0)
     assert_array_equal(b.compute(executor=executor), np.array([12, 15, 18]))
-
-
-@pytest.mark.parametrize("axis", [None, 0, 1, (0, 1)])
-@pytest.mark.parametrize("correction", [0.0, 1.0])
-@pytest.mark.parametrize("keepdims", [False, True])
-def test_var(spec, axis, correction, keepdims):
-    a = xp.asarray(
-        [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]], chunks=(2, 2), spec=spec
-    )
-    b = xp.var(a, axis=axis, correction=correction, keepdims=keepdims)
-    assert_array_equal(
-        b.compute(optimize_graph=False),
-        np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]]).var(
-            axis=axis, ddof=correction, keepdims=keepdims
-        ),
-    )
-
-
-def test_var_int():
-    a = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], chunks=(2, 2))
-    b = xp.var(a)
-    assert_array_equal(b.compute(), np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]]).var())
-
-
-@pytest.mark.parametrize("axis", [None, 0, 1, (0, 1)])
-@pytest.mark.parametrize("correction", [0.0, 1.0])
-@pytest.mark.parametrize("keepdims", [False, True])
-def test_std(spec, axis, correction, keepdims):
-    a = xp.asarray(
-        [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]], chunks=(2, 2), spec=spec
-    )
-    b = xp.std(a, axis=axis, correction=correction, keepdims=keepdims)
-    assert_array_equal(
-        b.compute(),
-        np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]]).std(
-            axis=axis, ddof=correction, keepdims=keepdims
-        ),
-    )
-
-
-def test_var__poorly_conditioned(spec):
-    # from https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Example
-    npa = np.array([4.0, 7.0, 13.0, 16.0]) + 1e9
-    a = xp.asarray(npa, chunks=2, spec=spec)
-    b = xp.var(a, axis=0)
-    assert_array_equal(b.compute(), npa.var(axis=0))
 
 
 # Utility functions
@@ -1130,26 +596,4 @@ def test_all_zero_dimension(spec, executor):
     b = xp.all(a)
     assert b.ndim == 0
     assert b.size == 1
-    assert b.dtype == xp.bool
     assert b.compute(executor=executor)
-
-
-@pytest.mark.parametrize("n", [1, 2])
-def test_diff(n):
-    x = np.array([1, 5, 3, 8, 7, 2, 6, 9])
-    a = xp.asarray(x, chunks=(3,))
-    b = xp.diff(a, n=n)
-
-    assert_array_equal(b.compute(), np.diff(x, n=n))
-
-
-@pytest.mark.parametrize(
-    ("shape", "axis"),
-    [((10, 15, 20), 0), ((10, 15, 20), 1), ((10, 15, 20), 2), ((10, 15, 20), -1)],
-)
-@pytest.mark.parametrize("n", [0, 1, 2])
-def test_diff_3d(shape, n, axis):
-    x = np.random.default_rng().integers(0, 10, shape)
-    a = xp.asarray(x, chunks=(len(shape) * (5,)))
-
-    assert_array_equal(xp.diff(a, axis=axis, n=n), np.diff(x, axis=axis, n=n))

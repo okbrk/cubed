@@ -1,3 +1,0 @@
-spec:
-  allowed_mem: "2GB"
-  executor_name: "processes"

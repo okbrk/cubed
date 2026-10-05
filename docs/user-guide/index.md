@@ -10,8 +10,5 @@ executors
 storage
 memory
 reliability
-optimization
 scaling
-diagnostics
-gpus
 ```

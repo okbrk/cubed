@@ -1,5 +1,7 @@
 # Examples running Cubed on Modal
 
+**Warning: Modal does not guarantee that functions run in any particular cloud region, so it is not currently recommended that you run large computations since excessive data transfer fees are possible.**
+
 ## Pre-requisites
 
 1. A [Modal account](https://modal.com/)
@@ -8,23 +10,43 @@
 ## Set up
 
 1. Add a new [Modal secret](https://modal.com/secrets), by following the Google Cloud wizard. This will prompt you to fill in values for `SERVICE_ACCOUNT_JSON` (it has instructions on how to create it, make sure you add the "Storage Admin" role). Call the secret `my-googlecloud-secret`.
-2. Create a new GCS bucket (called `cubed-<username>-temp`, for example) in a [region supported by Modal](https://modal.com/docs/guide/region-selection). This will be used for intermediate data.
-3. Edit the file `cubed.yaml` and change the `spec.executor_options.region` key to be the region that you created the GCS bucket in.
-4. Install a Python environment by running the following from this directory:
+2. Create a new GCS bucket (called `cubed-<username>-temp`, for example) in the `us-east-1` region. This will be used for intermediate data.
+3. Install a Python environment by running the following from this directory:
 
 ```shell
-conda create --name cubed-modal-gcp-examples -y python=3.12
+conda create --name cubed-modal-gcp-examples -y python=3.8
 conda activate cubed-modal-gcp-examples
 pip install 'cubed[modal-gcp]'
-export CUBED_SPEC__EXECUTOR_OPTIONS__REQUIREMENTS_FILE=$(pwd)/requirements.txt
+export CUBED_MODAL_REQUIREMENTS_FILE=$(pwd)/requirements.txt
 ```
 
 ## Examples
 
-Before running the examples, first change to the top-level examples directory (`cd ../..`) and type
+Start with the simplest example:
 
 ```shell
-export CUBED_CONFIG=$(pwd)/modal/gcp
+python modal-add-asarray.py "gs://cubed-modal-$USER-temp"
 ```
 
-Then you can run the examples in the [docs](https://cubed-dev.github.io/cubed/examples/index.html).
+If successful it should print a 4x4 matrix.
+
+Run the other examples in a similar way
+
+```shell
+python modal-add-random.py "gs://cubed-modal-$USER-temp"
+```
+
+and
+
+```shell
+python modal-matmul-random.py "gs://cubed-modal-$USER-temp"
+```
+
+These will take longer to run as they operate on more data.
+
+The last two examples use `TimelineVisualizationCallback` which produce a plot showing the timeline of events in the task lifecycle.
+The plots are `png` files and are written in the `plots` directory with a timestamp. Open the latest one with
+
+```shell
+open plots/$(ls plots | tail -1)
+```

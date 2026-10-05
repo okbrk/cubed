@@ -1,29 +1,14 @@
 import math
-from typing import TypeVar
-
-from cubed.spec import Spec
-from cubed.utils import is_cloud_storage_path
+from typing import Dict, TypeVar
 
 T = TypeVar("T")
-
-
-def use_backups_default(spec: Spec | None) -> bool:
-    """The default setting for ``use_backups``.
-
-    Backup tasks are only enabled on cloud object stores since they provide atomic writes.
-    """
-    return (
-        spec is not None
-        and spec.work_dir is not None
-        and is_cloud_storage_path(spec.work_dir)
-    )
 
 
 def should_launch_backup(
     task: T,
     now: float,
-    start_times: dict[T, float],
-    end_times: dict[T, float],
+    start_times: Dict[T, float],
+    end_times: Dict[T, float],
     min_tasks: int = 10,
     min_completed_fraction: float = 0.5,
     slow_factor: float = 3.0,
@@ -44,10 +29,4 @@ def should_launch_backup(
         [end_times[task] - start_times[task] for task in end_times]
     )
     duration = now - start_times[task]
-    result = duration > completed_durations[n] * slow_factor
-    if result:
-        print(
-            "should_launch_backup is True, with duration=%s, completed_durations=%s, n=%s, completed_durations[n]=%s, slow_factor=%s"
-            % (duration, completed_durations, n, completed_durations[n], slow_factor)
-        )
-    return result
+    return duration > completed_durations[n] * slow_factor

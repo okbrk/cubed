@@ -1,55 +1,21 @@
-from __future__ import annotations
-
-import inspect
 import itertools
-import logging
 import math
-from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from functools import partial
-from typing import (
-    Any,
-    Generic,
-    TypeAlias,
-    TypeVar,
-    cast,
-    overload,
-)
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 import toolz
 import zarr
+from toolz import map
 
-from cubed.backend_array_api import (
-    backend_array_to_numpy_array,
-    numpy_array_to_backend_array,
-)
-from cubed.primitive.memory import BufferCopies, MemoryModeller, calculate_projected_mem
-from cubed.primitive.types import CubedArrayProxy, PrimitiveOperation
-from cubed.runtime.types import CubedPipeline
-from cubed.storage.store import is_storage_array
-from cubed.storage.zarr import LazyZarrArray, T_ZarrArray, lazy_zarr_array
-from cubed.types import (
-    T_Chunks,
-    T_DType,
-    T_RectangularChunks,
-    T_RegularChunks,
-    T_Shape,
-    T_Store,
-)
-from cubed.utils import (
-    array_memory,
-    chunk_memory,
-    get_item,
-    largest_chunk,
-    normalize_chunks,
-    to_chunksize,
-)
-from cubed.utils import numblocks as compute_numblocks
+from cubed.storage.zarr import T_ZarrArray, lazy_empty
+from cubed.types import T_Chunks, T_DType, T_Shape, T_Store
+from cubed.utils import chunk_memory, get_item, to_chunksize
+from cubed.vendor.dask.array.core import normalize_chunks
 from cubed.vendor.dask.blockwise import _get_coord_mapping, _make_dims, lol_product
 from cubed.vendor.dask.core import flatten
 
-logger = logging.getLogger(__name__)
-
+from .types import CubedArrayProxy, CubedPipeline
 
 sym_counter = 0
 
@@ -61,41 +27,6 @@ def gensym(name: str) -> str:
 
 
 @dataclass(frozen=True)
-class ChunkKey:
-    """Specifies a chunk in a (named) array by chunk coords."""
-
-    name: str
-    coords: tuple[int, ...]
-
-    def __repr__(self) -> str:
-        return str(self)
-
-    def __str__(self) -> str:
-        return str((self.name,) + self.coords)
-
-
-ChunkKeyCollection: TypeAlias = ChunkKey | list[ChunkKey] | Iterator[ChunkKey]
-
-T = TypeVar("T")
-
-
-class FunctionArgs(Generic[T]):
-    def __init__(self, *args: T, output_name: str) -> None:
-        # output_name is the name of the array that the function produces
-        self.args: tuple[T, ...] = args
-        self.output_name = output_name
-
-    def __repr__(self) -> str:
-        return "≪" + ", ".join(repr(v) for v in self.args) + "≫"
-
-    def __str__(self) -> str:
-        return "≪" + ", ".join(str(v) for v in self.args) + "≫"
-
-
-KeyFunction: TypeAlias = Callable[[ChunkKey], FunctionArgs[Any]]
-
-
-@dataclass(frozen=False)
 class BlockwiseSpec:
     """Specification for how to run blockwise on an array.
 
@@ -103,132 +34,72 @@ class BlockwiseSpec:
 
     Attributes
     ----------
-    back_key_function : Callable[[ChunkKey], FunctionArgs[Any]]
-        A function that maps an output chunk key to one or more input chunk keys.
-    function : Callable[..., Any]
+    block_function : Callable
+        A function that maps input chunk indexes to an output chunk index.
+    function : Callable
         A function that maps input chunks to an output chunk.
-    num_input_blocks: Tuple[int, ...]
-        The number of input blocks read from each input array.
-    num_output_blocks: Tuple[int, ...]
-        The number of output blocks written to each output array.
     reads_map : Dict[str, CubedArrayProxy]
         Read proxy dictionary keyed by array name.
-    writes_map : Dict[str, CubedArrayProxy]
-        Write proxy dictionary keyed by array name where entries have an ``array`` attribute that supports ``__setitem__``.
-        Note that the order of the entries must correspond to the order of the outputs created by the function.
+    write : CubedArrayProxy
+        Write proxy with an ``array`` attribute that supports ``__setitem__``.
     """
 
-    back_key_function: Callable[[ChunkKey], FunctionArgs[Any]]
+    block_function: Callable[..., Any]
     function: Callable[..., Any]
-    num_input_blocks: tuple[int, ...]
-    num_output_blocks: tuple[int, ...]
-    reads_map: dict[str, CubedArrayProxy]
-    writes_map: dict[str, CubedArrayProxy]
-    return_writes_stores: bool = False
+    reads_map: Dict[str, CubedArrayProxy]
+    write: CubedArrayProxy
 
 
-def apply_blockwise(
-    out_coords: list[int], *, config: BlockwiseSpec
-) -> list[T_Store] | None:
+def apply_blockwise(out_key: List[int], *, config: BlockwiseSpec) -> None:
     """Stage function for blockwise."""
     # lithops needs params to be lists not tuples, so convert back
-    out_coords_tuple = tuple(out_coords)
+    out_key_tuple = tuple(out_key)
+    out_chunk_key = key_to_slices(
+        out_key_tuple, config.write.array, config.write.chunks
+    )
+    args = []
+    name_chunk_inds = config.block_function(("out",) + out_key_tuple)
+    for name_chunk_ind in name_chunk_inds:
+        name = name_chunk_ind[0]
+        chunk_ind = name_chunk_ind[1:]
+        arr = config.reads_map[name].open()
+        chunk_key = key_to_slices(chunk_ind, arr)
+        arg = arr[chunk_key]
+        args.append(arg)
 
-    results = get_results_in_different_scope(out_coords, config=config)
-
-    # if blockwise function is a regular function (not a generator) that doesn't return multiple values then make it iterable
-    if not inspect.isgeneratorfunction(config.function) and not isinstance(
-        results, tuple
-    ):
-        results = (results,)
-    for result, write_proxy in zip(results, config.writes_map.values()):
-        out_chunk_key = key_to_slices(
-            out_coords_tuple, write_proxy.array, write_proxy.chunks
-        )
-        if isinstance(result, dict):  # group of arrays with named fields
-            for k, v in result.items():
-                v = backend_array_to_numpy_array(v)
-                write_proxy.open().set_basic_selection(out_chunk_key, v, fields=k)
-        else:
-            result = backend_array_to_numpy_array(result)
-            write_proxy.open()[out_chunk_key] = result
-
-    if config.return_writes_stores:
-        return [write_proxy.open().store for write_proxy in config.writes_map.values()]
-    return None
-
-
-def get_results_in_different_scope(out_coords: list[int], *, config: BlockwiseSpec):
-    # wrap function call in a function so that args go out of scope (and free memory) as soon as results are returned
-
-    # lithops needs params to be lists not tuples, so convert back
-    out_coords_tuple = tuple(out_coords)
-
-    # get array chunks for input keys, preserving any nested list structure
-    get_chunk_config = partial(get_chunk, config=config)
-    out_key = ChunkKey(
-        "out", out_coords_tuple
-    )  # array name is ignored by back_key_function
-
-    name_chunk_inds = config.back_key_function(out_key)
-    fargs = map_nested(get_chunk_config, name_chunk_inds)
-
-    return config.function(*fargs.args)
+    result = config.function(*args)
+    if isinstance(result, dict):  # structured array with named fields
+        for k, v in result.items():
+            config.write.open().set_basic_selection(out_chunk_key, v, fields=k)
+    else:
+        config.write.open()[out_chunk_key] = result
 
 
 def key_to_slices(
-    key: tuple[int, ...], arr: T_ZarrArray, chunks: T_Chunks | None = None
-) -> tuple[slice, ...]:
+    key: Tuple[int, ...], arr: T_ZarrArray, chunks: Optional[T_Chunks] = None
+) -> Tuple[slice, ...]:
     """Convert a chunk index key to a tuple of slices"""
-    if chunks is None:
-        try:
-            chunks = arr.chunks
-        except NotImplementedError:
-            # rectilinear chunk grids don't support .chunks
-            chunks = arr.read_chunk_sizes  # type: ignore[union-attr]
-    chunks = normalize_chunks(chunks, shape=arr.shape, dtype=arr.dtype)
+    chunks = normalize_chunks(chunks or arr.chunks, shape=arr.shape, dtype=arr.dtype)
     return get_item(chunks, key)
-
-
-def get_chunk(in_key, config):
-    """Read a chunk from the named array"""
-    name = in_key.name
-    in_coords = in_key.coords
-    arr = config.reads_map[name].open()
-    selection = key_to_slices(in_coords, arr)
-    arg = arr[selection]
-    arg = numpy_array_to_backend_array(arg)
-    return arg
 
 
 def blockwise(
     func: Callable[..., Any],
-    out_ind: Sequence[str | int],
+    out_ind: Sequence[Union[str, int]],
     *args: Any,
     allowed_mem: int,
     reserved_mem: int,
     target_store: T_Store,
-    target_name: str,
-    target_path: str | None = None,
-    storage_options: dict[str, Any] | None = None,
-    compressor: dict | str | None = "auto",
     shape: T_Shape,
     dtype: T_DType,
     chunks: T_Chunks,
-    new_axes: dict[int, int] | None = None,
-    in_names: list[str] | None = None,
+    new_axes: Optional[Dict[int, int]] = None,
+    in_names: Optional[List[str]] = None,
+    out_name: Optional[str] = None,
     extra_projected_mem: int = 0,
-    buffer_copies: BufferCopies | None = None,
-    extra_func_kwargs: dict[str, Any] | None = None,
-    fusable_with_predecessors: bool = True,
-    fusable_with_successors: bool = True,
-    num_input_blocks: tuple[int, ...] | None = None,
     **kwargs,
-) -> PrimitiveOperation:
-    """Apply a function to multiple blocks from multiple inputs, expressed using concise indexing rules.
-
-    Unlike ```general_blockwise``, an index notation is used to specify the block mapping,
-    like in Dask Array.
+):
+    """Apply a function across blocks from multiple source Zarr arrays.
 
     Parameters
     ----------
@@ -255,11 +126,6 @@ def blockwise(
     extra_projected_mem : int
         Extra memory projected to be needed (in bytes) in addition to the memory used reading
         the input arrays and writing the output.
-    buffer_copies: BufferCopies
-        The the number of buffer copies incurred for array storage operations.
-    extra_func_kwargs : dict
-        Extra keyword arguments to pass to function that can't be passed as regular keyword arguments
-        since they clash with other blockwise arguments (such as dtype).
     **kwargs : dict
         Extra keyword arguments to pass to function
 
@@ -268,762 +134,178 @@ def blockwise(
     CubedPipeline to run the operation
     """
 
+    # Use dask's make_blockwise_graph
     arrays: Sequence[T_ZarrArray] = args[::2]
     array_names = in_names or [f"in_{i}" for i in range(len(arrays))]
+    array_map = {name: array for name, array in zip(array_names, arrays)}
 
-    inds: Sequence[str | int] = args[1::2]
+    inds: Sequence[Union[str, int]] = args[1::2]
 
-    numblocks: dict[str, tuple[int, ...]] = {}
-    for name, array in zip(array_names, arrays, strict=True):
+    numblocks: Dict[str, Tuple[int, ...]] = {}
+    for name, array in zip(array_names, arrays):
         input_chunks = normalize_chunks(
             array.chunks, shape=array.shape, dtype=array.dtype
         )
         numblocks[name] = tuple(map(len, input_chunks))
 
-    argindsstr: list[Any] = []
-    for name, ind in zip(array_names, inds, strict=True):
+    argindsstr: List[Any] = []
+    for name, ind in zip(array_names, inds):
         argindsstr.extend((name, ind))
 
-    back_key_function = make_blockwise_back_key_function_flattened(
+    # TODO: check output shape and chunks are consistent with inputs
+    chunks = normalize_chunks(chunks, shape=shape, dtype=dtype)
+
+    # block func
+
+    block_function = make_blockwise_function_flattened(
         func,
-        target_name,
+        out_name or "out",
         out_ind,
         *argindsstr,
         numblocks=numblocks,
         new_axes=new_axes,
     )
 
-    return general_blockwise(
+    output_blocks_generator_fn = partial(
+        get_output_blocks,
         func,
-        back_key_function,
-        *arrays,
-        allowed_mem=allowed_mem,
-        reserved_mem=reserved_mem,
-        target_stores=[target_store],
-        target_names=[target_name],
-        target_paths=[target_path] if target_path is not None else None,
-        storage_options=storage_options,
-        compressor=compressor,
-        shapes=[shape],
-        dtypes=[dtype],
-        chunkss=[chunks],
-        in_names=in_names,
-        extra_projected_mem=extra_projected_mem,
-        buffer_copies=buffer_copies,
-        extra_func_kwargs=extra_func_kwargs,
-        fusable_with_predecessors=fusable_with_predecessors,
-        fusable_with_successors=fusable_with_successors,
-        num_input_blocks=num_input_blocks,
-        **kwargs,
+        out_name or "out",
+        out_ind,
+        *argindsstr,
+        numblocks=numblocks,
+        new_axes=new_axes,
+    )
+    output_blocks = IterableFromGenerator(output_blocks_generator_fn)
+
+    num_tasks = num_output_blocks(
+        func,
+        out_name or "out",
+        out_ind,
+        *argindsstr,
+        numblocks=numblocks,
+        new_axes=new_axes,
     )
 
+    # end block func
 
-def general_blockwise(
-    func: Callable[..., Any],
-    back_key_function: Callable[[ChunkKey], FunctionArgs[Any]],
-    *arrays: Any,
-    allowed_mem: int,
-    reserved_mem: int,
-    target_stores: list[T_Store],
-    target_names: list[str],
-    target_paths: list[str] | None = None,
-    storage_options: dict[str, Any] | None = None,
-    compressor: dict | str | None = "auto",
-    shapes: list[T_Shape],
-    dtypes: list[T_DType],
-    chunkss: list[T_Chunks],
-    in_names: list[str] | None = None,
-    extra_projected_mem: int = 0,
-    buffer_copies: BufferCopies | None = None,
-    extra_func_kwargs: dict[str, Any] | None = None,
-    fusable_with_predecessors: bool = True,
-    fusable_with_successors: bool = True,
-    num_input_blocks: tuple[int, ...] | None = None,
-    target_chunks_: T_RegularChunks | None = None,
-    return_writes_stores: bool = False,
-    output_blocks: Iterator[list[int]] | None = None,
-    num_tasks=None,
-    **kwargs,
-) -> PrimitiveOperation:
-    """A more general form of ``blockwise`` that uses a function to specify the block
-    mapping, rather than an index notation, and which supports multiple outputs.
+    chunksize = to_chunksize(chunks)
+    if isinstance(target_store, zarr.Array):
+        target_array = target_store
+    else:
+        target_array = lazy_empty(
+            shape, dtype=dtype, chunks=chunksize, store=target_store
+        )
 
-    For multiple outputs, all output arrays must have matching numblocks.
-
-    Parameters
-    ----------
-    func : callable
-        Function to apply to individual tuples of blocks
-    back_key_function : callable
-        A function that maps an output chunk key to one or more input chunk keys.
-    *arrays : sequence of Array
-        The input arrays.
-    allowed_mem : int
-        The memory available to a worker for running a task, in bytes. Includes ``reserved_mem``.
-    reserved_mem : int
-        The memory reserved on a worker for non-data use when running a task, in bytes
-    target_store : string or zarr.Array
-        Path to output Zarr store, or Zarr array
-    shape : tuple
-        The shape of the output array.
-    dtype : np.dtype
-        The ``dtype`` of the output array.
-    chunks : tuple
-        The chunks of the output array.
-    extra_projected_mem : int
-        Extra memory projected to be needed (in bytes) in addition to the memory used reading
-        the input arrays and writing the output.
-    buffer_copies: BufferCopies
-        The the number of buffer copies incurred for array storage operations.
-    extra_func_kwargs : dict
-        Extra keyword arguments to pass to function that can't be passed as regular keyword arguments
-        since they clash with other blockwise arguments (such as dtype).
-    **kwargs : dict
-        Extra keyword arguments to pass to function
-
-    Returns
-    -------
-    PrimitiveOperation to run the operation
-    """
-    array_names = in_names or [f"in_{i}" for i in range(len(arrays))]
-    array_map = {name: array for name, array in zip(array_names, arrays, strict=True)}
-
-    func_kwargs = extra_func_kwargs or {}
-    func_with_kwargs = partial(func, **{**kwargs, **func_kwargs})
-    num_input_blocks = num_input_blocks or (1,) * len(arrays)
+    func_with_kwargs = partial(func, **kwargs)
     read_proxies = {
         name: CubedArrayProxy(array, array.chunks) for name, array in array_map.items()
     }
+    write_proxy = CubedArrayProxy(target_array, chunksize)
+    spec = BlockwiseSpec(block_function, func_with_kwargs, read_proxies, write_proxy)
 
-    write_proxies = {}
-    output_chunk_memory = 0
-    target_arrays = []
+    # calculate projected memory
+    projected_mem = reserved_mem + extra_projected_mem
+    # inputs
+    for array in arrays:  # inputs
+        # memory for a compressed and an uncompressed input array chunk
+        # - we assume compression has no effect (so it's an overestimate)
+        # - ideally we'd be able to look at nbytes_stored,
+        #   but this is not possible in general since the array has not been written yet
+        projected_mem += chunk_memory(array.dtype, array.chunks) * 2
+    # output
+    # memory for a compressed and an uncompressed output array chunk
+    # - this assumes the blockwise function creates a new array)
+    # - numcodecs uses a working output buffer that's the size of the array being compressed
+    projected_mem += chunk_memory(dtype, chunksize) * 2
 
-    numblocks0: tuple[int, ...] | None = None
-    for i, target_store in enumerate(target_stores):
-        chunks_normal = normalize_chunks(chunkss[i], shape=shapes[i], dtype=dtypes[i])
-        chunksize = to_chunksize(chunks_normal)
-        if numblocks0 is None:
-            numblocks0 = compute_numblocks(chunks_normal)
-        else:
-            numblocks = compute_numblocks(chunks_normal)
-            if numblocks != numblocks0:
-                raise ValueError(
-                    f"All outputs must have matching number of blocks in each dimension. Chunks specified: {chunkss}"
-                )
-        ta: zarr.Array | LazyZarrArray
-        if is_storage_array(target_store) or isinstance(target_store, LazyZarrArray):
-            ta = target_store
-        else:
-            ta = lazy_zarr_array(
-                target_store,
-                shapes[i],
-                dtype=dtypes[i],
-                chunks=target_chunks_ or chunksize,
-                path=target_names[i],  # use array name for path within store
-                storage_options=storage_options,
-                compressors=compressor,
-            )
-        target_arrays.append(ta)
-
-        write_proxies[target_names[i]] = CubedArrayProxy(ta, chunksize)
-
-        # only one output chunk is read into memory at a time, so we find the largest
-        output_chunk_memory = max(
-            output_chunk_memory, array_memory(dtypes[i], chunksize)
+    if projected_mem > allowed_mem:
+        raise ValueError(
+            f"Projected blockwise memory ({projected_mem}) exceeds allowed_mem ({allowed_mem}), including reserved_mem ({reserved_mem})"
         )
 
-    # the number of blocks written to each target array is currently the same
-    if target_chunks_ is None:
-        nb = 1
-    else:
-        # TODO: this is too small for irregular chunks
-        nb = math.prod(chunksize) // math.prod(largest_chunk(target_chunks_))
-    num_output_blocks = (nb,) * len(target_arrays)
-
-    spec = BlockwiseSpec(
-        back_key_function,
-        func_with_kwargs,
-        num_input_blocks,
-        num_output_blocks,
-        read_proxies,
-        write_proxies,
-        return_writes_stores,
-    )
-
-    buffer_copies = buffer_copies or BufferCopies(read=1, write=1)
-    projected_mem = calculate_projected_mem(
-        reserved_mem=reserved_mem,
-        inputs=[
-            array_memory(array.dtype, largest_chunk(array.chunks)) for array in arrays
-        ],
-        operation=extra_projected_mem,
-        output=output_chunk_memory,
-        buffer_copies=buffer_copies,
-    )
-
-    # this must be an iterator of lists, not of tuples, otherwise lithops breaks
-    mappable = output_blocks if output_blocks is not None else ChunkKeys(chunks_normal)
-    if num_tasks is None:
-        num_tasks = math.prod(len(c) for c in chunks_normal)
-
-    pipeline = CubedPipeline(
+    return CubedPipeline(
         apply_blockwise,
         gensym("apply_blockwise"),
-        mappable,
+        output_blocks,
         spec,
-    )
-    return PrimitiveOperation(
-        pipeline=pipeline,
-        source_array_names=array_names,
-        target_array=target_arrays[0] if len(target_arrays) == 1 else target_arrays,
-        projected_mem=projected_mem,
-        allowed_mem=allowed_mem,
-        reserved_mem=reserved_mem,
-        num_tasks=num_tasks,
-        fusable_with_predecessors=fusable_with_predecessors,
-        fusable_with_successors=fusable_with_successors,
-        write_chunks=chunksize,
+        target_array,
+        projected_mem,
+        reserved_mem,
+        num_tasks,
+        None,
     )
 
 
-# use this wrapper to avoid itertools.product pickle error
-class ChunkKeys(Iterable[list[int]]):
-    def __init__(self, chunks_normal: T_RectangularChunks):
-        self.chunks_normal = chunks_normal
-
-    def __iter__(self):
-        return map(
-            list, itertools.product(*[range(len(c)) for c in self.chunks_normal])
-        )
-
-    def range(self, start, stop=None):
-        """Allow efficient subsetting of the key space by range."""
-        if stop is None:
-            it = product_from(*[range(len(c)) for c in self.chunks_normal], start=start)
-        else:
-            it = itertools.islice(
-                product_from(*[range(len(c)) for c in self.chunks_normal], start=start),
-                stop - start,
-            )
-        return map(list, it)
+# Code for fusing pipelines
 
 
-def product_from(*iterables, start=0):
-    """Efficient implementation of 'itertools.product' starting at an arbitrary index."""
-    pools = [tuple(pool) for pool in iterables]
-
-    if not pools or any(len(pool) == 0 for pool in pools):
-        return
-
-    # Compute the total number of combinations
-    total = 1
-    for pool in pools:
-        total *= len(pool)
-
-    if start >= total:
-        return
-
-    # Decompose `start` into per-pool indices via mixed-radix conversion
-    indices = [0] * len(pools)
-    remainder = start
-    for k in range(len(pools) - 1, -1, -1):
-        indices[k] = remainder % len(pools[k])
-        remainder //= len(pools[k])
-
-    yield tuple(pool[i] for pool, i in zip(pools, indices))
-
-    while True:
-        for k in range(len(pools) - 1, -1, -1):
-            if indices[k] < len(pools[k]) - 1:
-                indices[k] += 1
-                for j in range(k + 1, len(pools)):
-                    indices[j] = 0
-                yield tuple(pools[j][indices[j]] for j in range(len(pools)))
-                break
-        else:
-            return
-
-
-In = TypeVar("In")
-Out = TypeVar("Out")
-
-
-def _map_nested_impl(func: Callable[[Any], Any], seq: Any) -> Any:
-    if isinstance(seq, list):
-        return [_map_nested_impl(func, item) for item in seq]
-    elif isinstance(seq, Iterator):
-        return map(lambda item: _map_nested_impl(func, item), seq)
-    elif isinstance(seq, FunctionArgs):
-        return FunctionArgs(
-            *[_map_nested_impl(func, item) for item in seq.args],
-            output_name=seq.output_name,
-        )
-    else:
-        return func(seq)
-
-
-# Overloads let callers know that a FunctionArgs input always yields a FunctionArgs
-# output (with the mapped leaf type), so .args is accessible without narrowing at
-# the call site and carries the result type Out.
-@overload
-def map_nested(
-    func: Callable[..., Out], seq: FunctionArgs[Any]
-) -> FunctionArgs[Out]: ...
-
-
-@overload
-def map_nested(
-    func: Callable[..., Any],
-    seq: list[Any],
-) -> list[Any]: ...
-
-
-@overload
-def map_nested(
-    func: Callable[..., Any],
-    seq: Iterator[Any],
-) -> Iterator[Any]: ...
-
-
-@overload
-def map_nested(
-    func: Callable[[In], Out],
-    seq: In,
-) -> Out: ...
-
-
-def map_nested(
-    func: Callable[[In], Out],
-    seq: In | list[Any] | Iterator[Any] | FunctionArgs[Any],
-) -> Out | list[Any] | Iterator[Any] | FunctionArgs[Any]:
-    """Apply a function inside nested lists or iterators, while preserving
-    the nesting, and the collection or iterator type.
-
-    Examples
-    --------
-
-    >>> inc = lambda x: x + 1
-    >>> map_nested(inc, [[1, 2], [3, 4]])
-    [[2, 3], [4, 5]]
-
-    >>> it = map_nested(inc, iter([1, 2]))
-    >>> next(it)
-    2
-    >>> next(it)
-    3
+def is_fuse_candidate(pipeline: CubedPipeline) -> bool:
     """
-    result: Out | list[Any] | Iterator[Any] | FunctionArgs[Any] = _map_nested_impl(
-        func, seq
-    )
-    return result
-
-
-# Code for fusing blockwise operations
-
-
-def is_fuse_candidate(primitive_op: PrimitiveOperation) -> bool:
+    Return True if a pipeline is a candidate for blockwise fusion.
     """
-    Return True if a primitive operation is a candidate for blockwise fusion.
-    """
-    return primitive_op.pipeline.function == apply_blockwise and (
-        primitive_op.fusable_with_predecessors or primitive_op.fusable_with_successors
-    )
+    return pipeline.function == apply_blockwise
 
 
-def can_fuse_primitive_ops(
-    primitive_op1: PrimitiveOperation, primitive_op2: PrimitiveOperation
-) -> bool:
-    if is_fuse_candidate(primitive_op1) and is_fuse_candidate(primitive_op2):
-        return primitive_op1.num_tasks == primitive_op2.num_tasks
+def can_fuse_pipelines(pipeline1: CubedPipeline, pipeline2: CubedPipeline) -> bool:
+    if is_fuse_candidate(pipeline1) and is_fuse_candidate(pipeline2):
+        return pipeline1.num_tasks == pipeline2.num_tasks
     return False
 
 
-def can_fuse_multiple_primitive_ops(
-    name: str,
-    primitive_op: PrimitiveOperation,
-    predecessor_primitive_ops: list[PrimitiveOperation | None],
-    *,
-    max_total_num_input_blocks: int | None = None,
-) -> bool:
-    if is_fuse_candidate(primitive_op) and all(
-        p is None or is_fuse_candidate(p) for p in predecessor_primitive_ops
-    ):
-        # If the peak projected memory for running all the predecessor ops in
-        # order is larger than allowed_mem then we can't fuse.
-        peak_projected = peak_projected_mem(predecessor_primitive_ops)
-        if peak_projected > primitive_op.allowed_mem:
-            logger.debug(
-                "can't fuse %s since peak projected memory for predecessor ops (%s) is greater than allowed (%s)",
-                name,
-                peak_projected,
-                primitive_op.allowed_mem,
-            )
-            return False
-        if max_total_num_input_blocks is None:
-            # If max total input blocks not specified, then only fuse if num
-            # tasks of predecessor ops match.
-            ret = all(
-                primitive_op.num_tasks == p.num_tasks
-                for p in predecessor_primitive_ops
-                if p is not None
-            )
-            if ret:
-                logger.debug(
-                    "can fuse %s since num tasks of predecessor ops match", name
-                )
-            else:
-                logger.debug(
-                    "can't fuse %s since num tasks of predecessor ops do not match",
-                    name,
-                )
-            return ret
-        else:
-            num_input_blocks = primitive_op.pipeline.config.num_input_blocks
-            total_num_input_blocks = 0
-            for ni, p in zip(num_input_blocks, predecessor_primitive_ops, strict=True):
-                if p is None:
-                    continue
-                for nj in p.pipeline.config.num_input_blocks:
-                    total_num_input_blocks += ni * nj
-            ret = total_num_input_blocks <= max_total_num_input_blocks
-            if ret:
-                logger.debug(
-                    "can fuse %s since total number of input blocks (%s) does not exceed max (%s)",
-                    name,
-                    total_num_input_blocks,
-                    max_total_num_input_blocks,
-                )
-            else:
-                logger.debug(
-                    "can't fuse %s since total number of input blocks (%s) exceeds max (%s)",
-                    name,
-                    total_num_input_blocks,
-                    max_total_num_input_blocks,
-                )
-            return ret
-    logger.debug(
-        "can't fuse %s since primitive op and predecessors are not all candidates", name
-    )
-    return False
-
-
-def peak_projected_mem(primitive_ops: Iterable[PrimitiveOperation | None]) -> int:
-    """Calculate the peak projected memory for running a series of primitive ops
-    and retaining their return values in memory."""
-    memory_modeller = MemoryModeller()
-    for p in primitive_ops:
-        if p is None:
-            continue
-        memory_modeller.allocate(p.projected_mem)
-        chunkmem = chunk_memory(p.target_array)
-        memory_modeller.free(p.projected_mem - chunkmem)
-    return memory_modeller.peak_mem
-
-
-def fuse(
-    primitive_op1: PrimitiveOperation, primitive_op2: PrimitiveOperation
-) -> PrimitiveOperation:
+def fuse(pipeline1: CubedPipeline, pipeline2: CubedPipeline) -> CubedPipeline:
     """
-    Fuse two blockwise operations into a single operation, avoiding writing to (or reading from) the target of the first operation.
+    Fuse two blockwise pipelines into a single pipeline, avoiding writing to (or reading from) the target of the first pipeline.
     """
 
-    assert primitive_op1.num_tasks == primitive_op2.num_tasks
-
-    pipeline1 = primitive_op1.pipeline
-    pipeline2 = primitive_op2.pipeline
+    assert pipeline1.num_tasks == pipeline2.num_tasks
 
     mappable = pipeline2.mappable
 
-    def fused_key_func(out_key: ChunkKey) -> FunctionArgs[Any]:
-        return pipeline1.config.back_key_function(
-            pipeline2.config.back_key_function(out_key).args[0]
+    def fused_blockwise_func(out_key):
+        return pipeline1.config.block_function(
+            *pipeline2.config.block_function(out_key)
         )
 
     def fused_func(*args):
         return pipeline2.config.function(pipeline1.config.function(*args))
 
     read_proxies = pipeline1.config.reads_map
-    write_proxies = pipeline2.config.writes_map
-    return_writes_stores = pipeline2.config.return_writes_stores
-    num_input_blocks = tuple(
-        n * pipeline2.config.num_input_blocks[0]
-        for n in pipeline1.config.num_input_blocks
-    )
-    num_output_blocks = pipeline2.config.num_output_blocks
-    spec = BlockwiseSpec(
-        fused_key_func,
-        fused_func,
-        num_input_blocks,
-        num_output_blocks,
-        read_proxies,
-        write_proxies,
-        return_writes_stores,
-    )
+    write_proxy = pipeline2.config.write
+    spec = BlockwiseSpec(fused_blockwise_func, fused_func, read_proxies, write_proxy)
 
-    source_array_names = primitive_op1.source_array_names
-    target_array = primitive_op2.target_array
-    projected_mem = max(primitive_op1.projected_mem, primitive_op2.projected_mem)
-    allowed_mem = primitive_op2.allowed_mem
-    reserved_mem = primitive_op2.reserved_mem
-    num_tasks = primitive_op2.num_tasks
+    target_array = pipeline2.target_array
+    projected_mem = max(pipeline1.projected_mem, pipeline2.projected_mem)
+    reserved_mem = max(pipeline1.reserved_mem, pipeline2.reserved_mem)
+    num_tasks = pipeline2.num_tasks
 
-    pipeline = CubedPipeline(
+    return CubedPipeline(
         apply_blockwise,
         gensym("fused_apply_blockwise"),
         mappable,
         spec,
-    )
-    return PrimitiveOperation(
-        pipeline=pipeline,
-        source_array_names=source_array_names,
-        target_array=target_array,
-        projected_mem=projected_mem,
-        allowed_mem=allowed_mem,
-        reserved_mem=reserved_mem,
-        num_tasks=num_tasks,
-        fusable_with_predecessors=True,
+        target_array,
+        projected_mem,
+        reserved_mem,
+        num_tasks,
+        None,
     )
 
 
-def fuse_multiple(
-    primitive_op: PrimitiveOperation,
-    *predecessor_primitive_ops: PrimitiveOperation | None,
-) -> PrimitiveOperation:
-    """
-    Fuse a blockwise operation and its predecessors into a single operation, avoiding writing to (or reading from) the targets of the predecessor operations.
-    """
-
-    bw_spec = primitive_op.pipeline.config
-
-    null_blockwise_spec = BlockwiseSpec(
-        back_key_function=lambda x: FunctionArgs(x, output_name=x.name),
-        function=lambda x: x,
-        num_input_blocks=(1,),
-        num_output_blocks=(1,),
-        reads_map={},
-        writes_map={},
-    )
-    predecessor_bw_specs = [
-        primitive_op.pipeline.config
-        if primitive_op is not None
-        else null_blockwise_spec
-        for primitive_op in predecessor_primitive_ops
-    ]
-
-    spec = fuse_blockwise_specs(bw_spec, *predecessor_bw_specs)
-
-    source_array_names = []
-    for i, p in enumerate(predecessor_primitive_ops):
-        if p is None:
-            source_array_names.append(primitive_op.source_array_names[i])
-        else:
-            source_array_names.extend(p.source_array_names)
-    target_array = primitive_op.target_array
-    projected_mem = max(
-        primitive_op.projected_mem,
-        peak_projected_mem(p for p in predecessor_primitive_ops if p is not None),
-    )
-    allowed_mem = primitive_op.allowed_mem
-    reserved_mem = primitive_op.reserved_mem
-    num_tasks = primitive_op.num_tasks
-
-    fused_pipeline = CubedPipeline(
-        apply_blockwise,
-        gensym("fused_apply_blockwise"),
-        primitive_op.pipeline.mappable,
-        spec,
-    )
-    return PrimitiveOperation(
-        pipeline=fused_pipeline,
-        source_array_names=source_array_names,
-        target_array=target_array,
-        projected_mem=projected_mem,
-        allowed_mem=allowed_mem,
-        reserved_mem=reserved_mem,
-        num_tasks=num_tasks,
-        fusable_with_predecessors=True,
-    )
+# blockwise functions
 
 
-def fuse_blockwise_specs(
-    bw_spec: BlockwiseSpec, *predecessor_bw_specs: BlockwiseSpec
-) -> BlockwiseSpec:
-    """
-    Fuse a blockwise spec and its predecessors into a single spec.
-    """
-
-    predecessor_back_key_functions_dict: dict[str, KeyFunction] = {}
-    predecessor_functions_dict: dict[str, Callable[..., Any]] = {}
-    for bws in predecessor_bw_specs:
-        for name in bws.writes_map.keys():
-            predecessor_back_key_functions_dict[name] = bws.back_key_function
-            predecessor_functions_dict[name] = bws.function
-
-    fused_key_func = make_fused_back_key_function(
-        bw_spec.back_key_function, predecessor_back_key_functions_dict
-    )
-    fused_func = make_fused_function(bw_spec.function, predecessor_functions_dict)
-
-    num_input_blocks = bw_spec.num_input_blocks
-    predecessor_num_blocks = [bws.num_input_blocks for bws in predecessor_bw_specs]
-    # note that the length of fused_num_input_blocks is the same as the number of input arrays
-    fused_num_input_blocks = tuple(
-        itertools.chain(
-            *(
-                tuple(n * m for m in nb)
-                for n, nb in zip(num_input_blocks, predecessor_num_blocks, strict=True)
-            )
-        )
-    )
-    fused_num_output_blocks = bw_spec.num_output_blocks
-
-    read_proxies = dict(bw_spec.reads_map)
-    for bws in predecessor_bw_specs:
-        read_proxies.update(bws.reads_map)
-    write_proxies = bw_spec.writes_map
-    return_writes_stores = bw_spec.return_writes_stores
-    return BlockwiseSpec(
-        fused_key_func,
-        fused_func,
-        fused_num_input_blocks,
-        fused_num_output_blocks,
-        read_proxies,
-        write_proxies,
-        return_writes_stores,
-    )
-
-
-def apply_blockwise_key_func(
-    arg: ChunkKeyCollection,
-    back_key_functions_dict: dict[str, KeyFunction],
-) -> FunctionArgs[Any] | list[FunctionArgs[Any]] | Iterator[FunctionArgs[Any]]:
-    if isinstance(arg, ChunkKey):
-        return _apply_blockwise_key_func_to_chunk_key(arg, back_key_functions_dict)
-    # more than one input block is being read from arg
-    if isinstance(arg, list):
-        return [
-            FunctionArgs(
-                *_apply_blockwise_key_func_to_chunk_key(
-                    a, back_key_functions_dict
-                ).args,
-                output_name=a.name,
-            )
-            for a in arg
-        ]
-    else:
-        return (
-            FunctionArgs(
-                *_apply_blockwise_key_func_to_chunk_key(
-                    a, back_key_functions_dict
-                ).args,
-                output_name=a.name,
-            )
-            for a in arg
-        )
-
-
-def _apply_blockwise_key_func_to_chunk_key(
-    arg: ChunkKey,
-    back_key_functions_dict: dict[str, KeyFunction],
-) -> FunctionArgs[Any]:
-    if arg.name not in back_key_functions_dict:
-        return FunctionArgs(arg, output_name=arg.name)
-    return back_key_functions_dict[arg.name](arg)
-
-
-def make_fused_back_key_function(
-    back_key_function: KeyFunction,
-    predecessor_back_key_functions_dict: dict[str, KeyFunction],
-) -> KeyFunction:
-    def fused_key_func(out_key: ChunkKey) -> FunctionArgs[Any]:
-        fargs = back_key_function(out_key)
-        args = fargs.args
-
-        # back_key_function is always an unfused function, so its args are
-        # ChunkKeyCollection at runtime. fargs.args is tuple[Any, ...] since
-        # FunctionArgs[Any] is used throughout the key function machinery,
-        # so each a: Any is assignable to ChunkKeyCollection without a cast.
-        func_args = tuple(
-            apply_blockwise_key_func(a, predecessor_back_key_functions_dict)
-            for a in args
-        )
-
-        # note this adds a layer of nesting
-        return FunctionArgs(*func_args, output_name=fargs.output_name)
-
-    return fused_key_func
-
-
-@overload
-def apply_blockwise_func(
-    arg: FunctionArgs[T],
-    functions_dict: dict[str, Callable[..., T]],
-) -> T: ...
-
-
-@overload
-def apply_blockwise_func(
-    arg: list[FunctionArgs[T]],
-    functions_dict: dict[str, Callable[..., T]],
-) -> list[T]: ...
-
-
-@overload
-def apply_blockwise_func(
-    arg: Iterator[FunctionArgs[T]],
-    functions_dict: dict[str, Callable[..., T]],
-) -> Iterator[T]: ...
-
-
-def apply_blockwise_func(
-    arg: FunctionArgs[T] | list[FunctionArgs[T]] | Iterator[FunctionArgs[T]],
-    functions_dict: dict[str, Callable[..., T]],
-) -> T | list[T] | Iterator[T]:
-    if isinstance(arg, FunctionArgs):
-        if arg.output_name not in functions_dict:
-            return arg.args[0] if len(arg.args) == 1 else list(arg.args)
-        return functions_dict[arg.output_name](*arg.args)
-    # more than one input block is being read from arg
-    if isinstance(arg, list):
-        return [apply_blockwise_func(a, functions_dict) for a in arg]
-    else:
-        return (apply_blockwise_func(a, functions_dict) for a in arg)
-
-
-def make_fused_function(
-    function: Callable[..., T],
-    predecessor_functions_dict: dict[str, Callable[..., T]],
-) -> Callable[..., T]:
-    def fused_func_single(*args: Any) -> T:
-        func_args = [apply_blockwise_func(a, predecessor_functions_dict) for a in args]
-        return function(*func_args)
-
-    # outer function is a generator (yields multiple outputs)
-    def fused_func_generator(*args: Any) -> Any:
-        func_args = [apply_blockwise_func(a, predecessor_functions_dict) for a in args]
-        yield from cast(Iterable[Any], function(*func_args))
-
-    return (
-        fused_func_generator
-        if inspect.isgeneratorfunction(function)
-        else fused_func_single
-    )
-
-
-# blockwise key functions
-
-
-def make_blockwise_back_key_function(
+def make_blockwise_function(
     func: Callable[..., Any],
     output: str,
-    out_indices: Sequence[str | int],
+    out_indices: Sequence[Union[str, int]],
     *arrind_pairs: Any,
-    numblocks: dict[str, tuple[int, ...]],
-    new_axes: dict[int, int] | None = None,
-) -> Callable[[ChunkKey], tuple[Any, ...]]:
+    numblocks: Optional[Dict[str, Tuple[int, ...]]] = None,
+    new_axes: Optional[Dict[int, int]] = None,
+) -> Callable[[List[int]], Any]:
     """Make a function that is the equivalent of make_blockwise_graph."""
 
+    if numblocks is None:
+        raise ValueError("Missing required numblocks argument.")
     new_axes = new_axes or {}
     argpairs = list(toolz.partition(2, arrind_pairs))
 
@@ -1041,25 +323,14 @@ def make_blockwise_back_key_function(
         False,
     )
 
-    for axes, (arg, _) in zip(concat_axes, argpairs, strict=True):
-        for ax in axes:
-            if numblocks[arg][ax] > 1:
-                raise ValueError(
-                    f"Cannot have multiple chunks in dropped axis {ax}. "
-                    "To fix, use a reduction after calling map_blocks "
-                    "without specifying drop_axis, or rechunk first."
-                )
-
-    def back_key_function(out_key: ChunkKey) -> tuple[Any, ...]:
-        out_coords = out_key.coords
+    def blockwise_fn(out_key):
+        out_coords = out_key[1:]
 
         # from Dask make_blockwise_graph
         deps = set()
         coords = out_coords + dummies
         args = []
-        for cmap, axes, (arg, ind) in zip(
-            coord_maps, concat_axes, argpairs, strict=True
-        ):
+        for cmap, axes, (arg, ind) in zip(coord_maps, concat_axes, argpairs):
             if ind is None:
                 args.append(arg)
             else:
@@ -1078,30 +349,74 @@ def make_blockwise_back_key_function(
 
         return val
 
-    return back_key_function
+    return blockwise_fn
 
 
-def make_blockwise_back_key_function_flattened(
+def make_blockwise_function_flattened(
     func: Callable[..., Any],
     output: str,
-    out_indices: Sequence[str | int],
+    out_indices: Sequence[Union[str, int]],
     *arrind_pairs: Any,
-    numblocks: dict[str, tuple[int, ...]],
-    new_axes: dict[int, int] | None = None,
-) -> Callable[[ChunkKey], FunctionArgs[Any]]:
-    # TODO: make this a part of make_blockwise_back_key_function?
-    back_key_function = make_blockwise_back_key_function(
+    numblocks: Optional[Dict[str, Tuple[int, ...]]] = None,
+    new_axes: Optional[Dict[int, int]] = None,
+) -> Callable[[List[int]], Any]:
+    # TODO: make this a part of make_blockwise_function?
+    blockwise_fn = make_blockwise_function(
         func, output, out_indices, *arrind_pairs, numblocks=numblocks, new_axes=new_axes
     )
 
     def blockwise_fn_flattened(out_key):
-        in_keys = back_key_function(out_key)[1:]  # drop function in position 0
+        name_chunk_inds = blockwise_fn(out_key)[1:]  # drop function in position 0
         # flatten (nested) lists indicating contraction
-        if isinstance(in_keys[0], list):
-            in_keys = list(flatten(in_keys))
-        return FunctionArgs(
-            *(ChunkKey(in_key[0], in_key[1:]) for in_key in in_keys),
-            output_name=out_key.name,
-        )
+        if isinstance(name_chunk_inds[0], list):
+            name_chunk_inds = list(flatten(name_chunk_inds))
+        return name_chunk_inds
 
     return blockwise_fn_flattened
+
+
+def get_output_blocks(
+    func: Callable[..., Any],
+    output: str,
+    out_indices: Sequence[Union[str, int]],
+    *arrind_pairs: Any,
+    numblocks: Optional[Dict[str, Tuple[int, ...]]] = None,
+    new_axes: Optional[Dict[int, int]] = None,
+) -> Iterator[List[int]]:
+    if numblocks is None:
+        raise ValueError("Missing required numblocks argument.")
+    new_axes = new_axes or {}
+    argpairs = list(toolz.partition(2, arrind_pairs))
+
+    # Dictionary mapping {i: 3, j: 4, ...} for i, j, ... the dimensions
+    dims = _make_dims(argpairs, numblocks, new_axes)
+
+    # return a list of lists, not of tuples, otherwise lithops breaks
+    for tup in itertools.product(*[range(dims[i]) for i in out_indices]):
+        yield list(tup)
+
+
+class IterableFromGenerator:
+    def __init__(self, generator_fn: Callable[[], Iterator[List[int]]]):
+        self.generator_fn = generator_fn
+
+    def __iter__(self):
+        return self.generator_fn()
+
+
+def num_output_blocks(
+    func: Callable[..., Any],
+    output: str,
+    out_indices: Sequence[Union[str, int]],
+    *arrind_pairs: Any,
+    numblocks: Optional[Dict[str, Tuple[int, ...]]] = None,
+    new_axes: Optional[Dict[int, int]] = None,
+) -> int:
+    if numblocks is None:
+        raise ValueError("Missing required numblocks argument.")
+    new_axes = new_axes or {}
+    argpairs = list(toolz.partition(2, arrind_pairs))
+
+    # Dictionary mapping {i: 3, j: 4, ...} for i, j, ... the dimensions
+    dims = _make_dims(argpairs, numblocks, new_axes)
+    return math.prod(dims[i] for i in out_indices)

@@ -1,147 +1,56 @@
 import math
 
-from cubed.array_api.data_type_functions import isdtype
+import numpy as np
+
 from cubed.array_api.dtypes import (
-    _integer_dtypes,
-    _real_numeric_dtypes,
-    _upcast_integral_dtypes,
+    _numeric_dtypes,
+    _signed_integer_dtypes,
+    _unsigned_integer_dtypes,
 )
-from cubed.array_api.elementwise_functions import sqrt
-from cubed.backend_array_api import namespace as nxp
-from cubed.core import reduction, scan
+from cubed.core import reduction
 
 
-def cumulative_prod(x, /, *, axis=None, dtype=None, include_initial=False, device=None):
-    if include_initial:
-        raise NotImplementedError("include_initial is not supported in cumulative_prod")
-    dtype = _upcast_integral_dtypes(
-        x,
-        dtype,
-        allowed_dtypes=(
-            "numeric",
-            "boolean",
-        ),
-        fname="cumulative_prod",
-        device=device,
-    )
-    return scan(
-        x,
-        preop=nxp.prod,
-        func=_cumulative_prod_func,
-        binop=nxp.multiply,
-        axis=axis,
-        dtype=dtype,
-    )
+def max(x, /, *, axis=None, keepdims=False):
+    if x.dtype not in _numeric_dtypes:
+        raise TypeError("Only numeric dtypes are allowed in max")
+    return reduction(x, np.max, axis=axis, dtype=x.dtype, keepdims=keepdims)
 
 
-def _cumulative_prod_func(a, /, *, axis=None, dtype=None, include_initial=False):
-    out = nxp.cumulative_prod(
-        a, axis=axis, dtype=dtype, include_initial=include_initial
-    )
-    if include_initial:
-        # we don't yet support including the final element as it complicates chunk sizing
-        ind = tuple(
-            slice(a.shape[i]) if i == axis else slice(None) for i in range(a.ndim)
-        )
-        out = out[ind]
-    return out
-
-
-def cumulative_sum(x, /, *, axis=None, dtype=None, include_initial=False, device=None):
-    if include_initial:
-        raise NotImplementedError("include_initial is not supported in cumulative_sum")
-    dtype = _upcast_integral_dtypes(
-        x,
-        dtype,
-        allowed_dtypes=(
-            "numeric",
-            "boolean",
-        ),
-        fname="cumulative_sum",
-        device=device,
-    )
-    return scan(
-        x,
-        preop=nxp.sum,
-        func=_cumulative_sum_func,
-        binop=nxp.add,
-        axis=axis,
-        dtype=dtype,
-    )
-
-
-def _cumulative_sum_func(a, /, *, axis=None, dtype=None, include_initial=False):
-    out = nxp.cumulative_sum(a, axis=axis, dtype=dtype, include_initial=include_initial)
-    if include_initial:
-        # we don't yet support including the final element as it complicates chunk sizing
-        ind = tuple(
-            slice(a.shape[i]) if i == axis else slice(None) for i in range(a.ndim)
-        )
-        out = out[ind]
-    return out
-
-
-def max(x, /, *, axis=None, keepdims=False, split_every=None):
-    if x.dtype not in _real_numeric_dtypes:
-        raise TypeError("Only real numeric dtypes are allowed in max")
-    return reduction(
-        x,
-        nxp.max,
-        axis=axis,
-        dtype=x.dtype,
-        split_every=split_every,
-        keepdims=keepdims,
-    )
-
-
-def mean(x, /, *, axis=None, keepdims=False, split_every=None):
-    # This implementation uses a Zarr group of two arrays to store a
+def mean(x, /, *, axis=None, keepdims=False):
+    # This implementation uses NumPy and Zarr's structured arrays to store a
     # pair of fields needed to keep per-chunk counts and totals for computing
-    # the mean.
-    if x.dtype in _integer_dtypes:
-        # From the spec: "if the input array x has an integer data type,
-        # the returned array must have the default real-valued floating-point data type"
-        dtype = nxp.__array_namespace_info__().default_dtypes(device=x.device)[
-            "real floating"
-        ]
-    else:
-        dtype = x.dtype
-    # TODO(#658): Should these be default dtypes?
-    if isdtype(x.dtype, "complex floating"):
-        intermediate_dtype = [("n", nxp.int64), ("total", nxp.complex128)]
-    else:
-        intermediate_dtype = [("n", nxp.int64), ("total", nxp.float64)]
-    extra_func_kwargs = dict(dtype=intermediate_dtype)
+    # the mean. Structured arrays are row-based, so are less efficient than
+    # regular arrays, but for a function that reduces the amount of data stored,
+    # this is usually OK. An alternative would be to add support for multiple
+    # outputs.
+    dtype = x.dtype
+    intermediate_dtype = [("n", np.int64), ("total", np.float64)]
     return reduction(
         x,
         _mean_func,
         combine_func=_mean_combine,
-        aggregate_func=_mean_aggregate,
+        aggegrate_func=_mean_aggregate,
         axis=axis,
         intermediate_dtype=intermediate_dtype,
         dtype=dtype,
         keepdims=keepdims,
-        split_every=split_every,
-        extra_func_kwargs=extra_func_kwargs,
     )
 
 
 def _mean_func(a, **kwargs):
-    dtype = dict(kwargs.pop("dtype"))
-    n = _numel(a, dtype=dtype["n"], **kwargs)
-    total = nxp.sum(a, dtype=dtype["total"], **kwargs)
+    n = _numel(a, **kwargs)
+    total = np.sum(a, **kwargs)
     return {"n": n, "total": total}
 
 
 def _mean_combine(a, **kwargs):
-    dtype = dict(kwargs.pop("dtype"))
-    n = nxp.sum(a["n"], dtype=dtype["n"], **kwargs)
-    total = nxp.sum(a["total"], dtype=dtype["total"], **kwargs)
+    n = np.sum(a["n"], **kwargs)
+    total = np.sum(a["total"], **kwargs)
     return {"n": n, "total": total}
 
 
-def _mean_aggregate(a, **kwargs):
-    return nxp.divide(a["total"], a["n"])
+def _mean_aggregate(a):
+    return np.divide(a["total"], a["n"])
 
 
 # based on dask
@@ -152,14 +61,14 @@ def _numel(x, **kwargs):
     shape = x.shape
     keepdims = kwargs.get("keepdims", False)
     axis = kwargs.get("axis", None)
-    dtype = kwargs.get("dtype", nxp.float64)
+    dtype = kwargs.get("dtype", np.float64)
 
     if axis is None:
-        prod = nxp.prod(shape, dtype=dtype)
+        prod = np.prod(shape, dtype=dtype)
         if keepdims is False:
             return prod
 
-        return nxp.full(shape=(1,) * len(shape), fill_value=prod, dtype=dtype)
+        return np.full(shape=(1,) * len(shape), fill_value=prod, dtype=dtype)
 
     if not isinstance(axis, (tuple, list)):
         axis = [axis]
@@ -172,151 +81,40 @@ def _numel(x, **kwargs):
     else:
         new_shape = tuple(shape[dim] for dim in range(len(shape)) if dim not in axis)
 
-    return nxp.broadcast_to(nxp.asarray(prod, dtype=dtype), new_shape)
+    return np.broadcast_to(np.array(prod, dtype=dtype), new_shape)
 
 
-def min(x, /, *, axis=None, keepdims=False, split_every=None):
-    if x.dtype not in _real_numeric_dtypes:
-        raise TypeError("Only real numeric dtypes are allowed in min")
-    return reduction(
-        x,
-        nxp.min,
-        axis=axis,
-        dtype=x.dtype,
-        split_every=split_every,
-        keepdims=keepdims,
-    )
+def min(x, /, *, axis=None, keepdims=False):
+    if x.dtype not in _numeric_dtypes:
+        raise TypeError("Only numeric dtypes are allowed in min")
+    return reduction(x, np.min, axis=axis, dtype=x.dtype, keepdims=keepdims)
 
 
-def prod(x, /, *, axis=None, dtype=None, keepdims=False, split_every=None, device=None):
-    dtype = _upcast_integral_dtypes(
-        x,
-        dtype,
-        allowed_dtypes=(
-            "numeric",
-            "boolean",
-        ),
-        fname="prod",
-        device=device,
-    )
-    extra_func_kwargs = dict(dtype=dtype)
-    return reduction(
-        x,
-        nxp.prod,
-        axis=axis,
-        dtype=dtype,
-        keepdims=keepdims,
-        split_every=split_every,
-        extra_func_kwargs=extra_func_kwargs,
-    )
+def prod(x, /, *, axis=None, dtype=None, keepdims=False):
+    if x.dtype not in _numeric_dtypes:
+        raise TypeError("Only numeric dtypes are allowed in prod")
+    if dtype is None:
+        if x.dtype in _signed_integer_dtypes:
+            dtype = np.int64
+        elif x.dtype in _unsigned_integer_dtypes:
+            dtype = np.uint64
+        elif x.dtype == np.float32:
+            dtype = np.float64
+        else:
+            dtype = x.dtype
+    return reduction(x, np.prod, axis=axis, dtype=dtype, keepdims=keepdims)
 
 
-def std(x, /, *, axis=None, correction=0.0, keepdims=False, split_every=None):
-    return sqrt(
-        var(
-            x,
-            axis=axis,
-            correction=correction,
-            keepdims=keepdims,
-            split_every=split_every,
-        )
-    )
-
-
-def sum(x, /, *, axis=None, dtype=None, keepdims=False, split_every=None, device=None):
-    dtype = _upcast_integral_dtypes(
-        x,
-        dtype,
-        allowed_dtypes=(
-            "numeric",
-            "boolean",
-        ),
-        fname="sum",
-        device=device,
-    )
-    extra_func_kwargs = dict(dtype=dtype)
-    return reduction(
-        x,
-        nxp.sum,
-        axis=axis,
-        dtype=dtype,
-        keepdims=keepdims,
-        split_every=split_every,
-        extra_func_kwargs=extra_func_kwargs,
-    )
-
-
-def var(
-    x,
-    /,
-    *,
-    axis=None,
-    correction=0.0,
-    keepdims=False,
-    split_every=None,
-):
-    # This implementation follows https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Parallel_algorithm
-    if x.dtype not in _real_numeric_dtypes:
-        raise TypeError("Only real numeric dtypes are allowed in var")
-    if x.dtype in _integer_dtypes:
-        # From the spec: "if the input array x has an integer data type,
-        # the returned array must have the default real-valued floating-point data type"
-        dtype = nxp.__array_namespace_info__().default_dtypes(device=x.device)[
-            "real floating"
-        ]
-    else:
-        dtype = x.dtype
-    # TODO(#658): Should these be default dtypes?
-    intermediate_dtype = [("n", nxp.int64), ("mu", nxp.float64), ("M2", nxp.float64)]
-    extra_func_kwargs = dict(dtype=intermediate_dtype, correction=correction)
-    return reduction(
-        x,
-        _var_func,
-        combine_func=_var_combine,
-        aggregate_func=_var_aggregate,
-        axis=axis,
-        intermediate_dtype=intermediate_dtype,
-        dtype=dtype,
-        keepdims=keepdims,
-        split_every=split_every,
-        extra_func_kwargs=extra_func_kwargs,
-    )
-
-
-def _var_func(a, correction=None, **kwargs):
-    dtype = dict(kwargs.pop("dtype"))
-    n = _numel(a, dtype=dtype["n"], **kwargs)
-    mu = nxp.mean(a, dtype=dtype["mu"], **kwargs)
-    M2 = nxp.sum(nxp.square(a - mu), dtype=dtype["M2"], **kwargs)
-    return {"n": n, "mu": mu, "M2": M2}
-
-
-def _var_combine(a, axis=None, correction=None, **kwargs):
-    # _var_combine is called by _partial_reduce which concatenates along the first axis
-    axis = axis[0]
-    if a["n"].shape[axis] == 1:  # nothing to combine
-        return a
-    if a["n"].shape[axis] != 2:
-        raise ValueError(f"Expected two elements in {axis} axis to combine")
-
-    n_a = nxp.take(a["n"], 0, axis=axis)
-    n_b = nxp.take(a["n"], 1, axis=axis)
-    mu_a = nxp.take(a["mu"], 0, axis=axis)
-    mu_b = nxp.take(a["mu"], 1, axis=axis)
-    M2_a = nxp.take(a["M2"], 0, axis=axis)
-    M2_b = nxp.take(a["M2"], 1, axis=axis)
-
-    n_ab = n_a + n_b
-    delta = mu_b - mu_a
-    mu_ab = (n_a * mu_a + n_b * mu_b) / n_ab
-    M2_ab = M2_a + M2_b + delta**2 * n_a * n_b / n_ab
-
-    n = nxp.expand_dims(n_ab, axis=axis)
-    mu = nxp.expand_dims(mu_ab, axis=axis)
-    M2 = nxp.expand_dims(M2_ab, axis=axis)
-
-    return {"n": n, "mu": mu, "M2": M2}
-
-
-def _var_aggregate(a, correction=None, **kwargs):
-    return nxp.divide(a["M2"], a["n"] - correction)
+def sum(x, /, *, axis=None, dtype=None, keepdims=False):
+    if x.dtype not in _numeric_dtypes:
+        raise TypeError("Only numeric dtypes are allowed in sum")
+    if dtype is None:
+        if x.dtype in _signed_integer_dtypes:
+            dtype = np.int64
+        elif x.dtype in _unsigned_integer_dtypes:
+            dtype = np.uint64
+        elif x.dtype == np.float32:
+            dtype = np.float64
+        else:
+            dtype = x.dtype
+    return reduction(x, np.sum, axis=axis, dtype=dtype, keepdims=keepdims)

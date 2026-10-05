@@ -2,33 +2,23 @@
 
 Cubed arrays are backed by Zarr arrays, and every chunk in the Zarr array is computed by a task running on a worker, which may be a local or remote process.
 
-Cubed provides a variety of executors for running the tasks in a computation, which are discussed below. Executors are also sometimes referred to as _runtimes_.
+Cubed provides a variety of executors for running the tasks in a computation, which are discussed below. Executors are also sometimes referred to as runtimes.
 
-## Local single-machine executors
+## Local Python executor
 
-If you don't specify an executor then the local in-process multi-threaded Python executor is used by default. This is called the `threads` executor. It doesn't require any set up so it is useful for quickly getting started and running on datasets that don't fit in memory, but that can fit on a single machine's disk.
+If you don't specify an executor then the local in-process Python executor is used. This is a very simple, single-threaded executor (called {py:class}`PythonDagExecutor <cubed.runtime.executors.python.PythonDagExecutor>`) that is intended for testing on small amounts of data before running larger computations using a cloud service.
 
-The `processes` executor also runs on a single machine, and uses all the cores on the machine. However, unlike the `threads` executor, each task runs in a separate process, which avoids GIL contention, but adds some overhead in process startup time and communication. Typically, running using `processes` is more performant than `threads`, but it is worth trying both on your workload to see which is best.
+## Which cloud service should I use?
 
-There is a third local executor called `single-threaded` that runs tasks sequentially in a single thread, and is intended for testing on small amounts of data.
+[**Modal**](https://modal.com/) is the easiest to get started with because it handles building a runtime environment for you automatically (note that it requires that you [sign up](https://modal.com/signup) for a free account).
+It has been tested with ~300 workers and works with AWS and GCP.
 
-(which-cloud-service)=
-## Which cloud service executor should I use?
+[**Lithops**](https://lithops-cloud.github.io/) requires slightly more work to get started since you have to build a runtime environment first.
+Lithops has support for many serverless services on various cloud providers, but has so far been tested on two:
+- **AWS Lambda** requires building a Docker container first, and has been tested with ~1000 workers.
+- **Google Cloud Functions** only requires building a Lithops runtime, which can be created from a pip-style `requirements.txt` without Docker. It has been tested with ~1000 workers.
 
-When it comes to scaling out, there are a number of executors that work in the cloud or on distributed systems more generally.
-
-[**Lithops**](https://lithops-cloud.github.io/) is the executor we recommend for most users, since it has had the most testing so far (~1000 workers).
-If your data is in Amazon S3 then use Lithops with AWS Lambda, and if it's in GCS use Lithops with Google Cloud Functions. You have to build a runtime environment as a part of the setting up process.
-
-[**Modal**](https://modal.com/) is very easy to get started with because it automatically builds a runtime environment in a matter of seconds (note that it requires that you [sign up](https://modal.com/signup) for a free account). It has been tested with ~100 workers.
-
-[**Coiled**](https://www.coiled.io/) is also easy to get started with ([sign up](https://cloud.coiled.io/signup)). It uses [Coiled Functions](https://docs.coiled.io/user_guide/usage/functions/index.html) and has a 1-2 minute overhead to start a cluster.
-
-[**Google Cloud Dataflow**](https://cloud.google.com/dataflow) is relatively straightforward to get started with. It has the highest overhead for worker startup (minutes compared to seconds for Modal or Lithops), and although it has only been tested with ~20 workers, it is a mature service and therefore should be reliable for much larger computations.
-
-[**Ray**](https://www.ray.io/) is a popular way to scale Python and AI applications. You can run Cubed computations on a Ray cluster.
-
-We have **experimental** executors for [**Globus Compute**](https://www.globus.org/) (see [#689](https://github.com/cubed-dev/cubed/pull/689)) and [**Apache Spark**](https://spark.apache.org/) (see [#499](https://github.com/cubed-dev/cubed/issues/499)). These have not had much testing, so we'd be very interested in feedback if you try them out.
+[**Google Cloud Dataflow**](https://cloud.google.com/dataflow) is relatively straightforward to get started with. It has the highest overhead for worker startup (minutes compared to seconds for Modal or Lithops), and although it has only been tested with ~20 workers, it is the most mature service and therefore should be reliable for much larger computations.
 
 ## Specifying an executor
 
@@ -36,12 +26,13 @@ An executor may be specified as a part of the {py:class}`Spec <cubed.Spec>`:
 
 ```python
 import cubed
+from cubed.runtime.executors.modal_async import AsyncModalDagExecutor
 
 spec = cubed.Spec(
     work_dir="s3://cubed-tomwhite-temp",
     allowed_mem="2GB",
-    executor_name="modal"
+    executor=AsyncModalDagExecutor()
 )
 ```
 
-A default spec may also be configured using a YAML file. The [examples](#cloud-set-up) show this in more detail for all of the executors described above.
+Alternatively an executor may be specified when {py:func}`compute() <cubed.compute>` is called. The [examples](https://github.com/tomwhite/cubed/tree/main/examples/README.md) show this in more detail for all of the cloud services described above.

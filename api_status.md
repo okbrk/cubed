@@ -1,10 +1,8 @@
 ## Array API Coverage Implementation Status
 
-Cubed supports version [2025.12](https://data-apis.org/array-api/2025.12/index.html) of the Python array API standard, with a few exceptions noted below. The [Fourier transform functions](https://data-apis.org/array-api/2025.12/extensions/fourier_transform_functions.html) are *not* supported.
+This table shows which parts of the the [Array API](https://data-apis.org/array-api/latest/API_specification/index.html) have been implemented in Cubed. For those that have not been implemented a rough level of difficulty is indicated (1=easy, 3=hard).
 
-This table shows which parts of the the [Array API](https://data-apis.org/array-api/latest/API_specification/index.html) have been implemented in Cubed, and which ones are missing. The version column shows the version when the feature was added to the standard, for version 2022.12 or later.
-
-| Category                 | Object/Function     | Implemented        | Version    | Notes                        |
+| Category                 | Object/Function     | Implemented        | Difficulty | Notes                        |
 | ------------------------ | ------------------- | ------------------ | ---------- | ---------------------------- |
 | Array object             | Arithmetic Ops      | :white_check_mark: |            |                              |
 |                          | Array Ops           | :white_check_mark: |            |                              |
@@ -32,96 +30,47 @@ This table shows which parts of the the [Array API](https://data-apis.org/array-
 |                          | `zeros`             | :white_check_mark: |            |                              |
 |                          | `zeros_like`        | :white_check_mark: |            |                              |
 | Data Type Functions      | `astype`            | :white_check_mark: |            |                              |
-|                          | `can_cast`          | :white_check_mark: |            |                              |
-|                          | `finfo`             | :white_check_mark: |            |                              |
-|                          | `iinfo`             | :white_check_mark: |            |                              |
-|                          | `result_type`       | :white_check_mark: |            |                              |
+|                          | `can_cast`          | :white_check_mark: |            | Same as `numpy.array_api`    |
+|                          | `finfo`             | :white_check_mark: |            | Same as `numpy.array_api`    |
+|                          | `iinfo`             | :white_check_mark: |            | Same as `numpy.array_api`    |
+|                          | `result_type`       | :white_check_mark: |            | Same as `numpy.array_api`    |
 | Data Types               | `bool`, `int8`, ... | :white_check_mark: |            |                              |
 | Elementwise Functions    | `add`               | :white_check_mark: |            | Example of a binary function |
 |                          | `negative`          | :white_check_mark: |            | Example of a unary function  |
 |                          | _others_            | :white_check_mark: |            |                              |
 | Indexing                 | Single-axis         | :white_check_mark: |            |                              |
 |                          | Multi-axis          | :white_check_mark: |            |                              |
-|                          | Boolean array       | :x:                |            | Shape is data dependent, [#73](https://github.com/cubed-dev/cubed/issues/73) |
-| Indexing Functions       | `take`              | :white_check_mark: | 2022.12    |                              |
-|                          | `take_along_axis`   | :x:                | 2024.12    |                              |
-| Inspection               | `capabilities`      | :white_check_mark: | 2023.12    |                              |
-|                          | `default_device`    | :white_check_mark: | 2023.12    |                              |
-|                          | `default_dtypes`    | :white_check_mark: | 2023.12    |                              |
-|                          | `devices`           | :white_check_mark: | 2023.12    |                              |
-|                          | `dtypes`            | :white_check_mark: | 2023.12    |                              |
+|                          | Boolean array       | :x:                | 3          | Shape is data dependent, [#73](https://github.com/tomwhite/cubed/issues/73) |
 | Linear Algebra Functions | `matmul`            | :white_check_mark: |            |                              |
 |                          | `matrix_transpose`  | :white_check_mark: |            |                              |
 |                          | `tensordot`         | :white_check_mark: |            |                              |
 |                          | `vecdot`            | :white_check_mark: |            |                              |
 | Manipulation Functions   | `broadcast_arrays`  | :white_check_mark: |            |                              |
-|                          | `broadcast_shapes`  | :white_check_mark: | 2025.12    |                              |
 |                          | `broadcast_to`      | :white_check_mark: |            |                              |
 |                          | `concat`            | :white_check_mark: |            |                              |
 |                          | `expand_dims`       | :white_check_mark: |            |                              |
-|                          | `flip`              | :white_check_mark: |            |                              |
+|                          | `flip`              | :x:                | 2          | Needs indexing with step=-1, [#114](https://github.com/tomwhite/cubed/issues/114) |
 |                          | `permute_dims`      | :white_check_mark: |            |                              |
-|                          | `repeat`            | :white_check_mark: | 2023.12    |                              |
 |                          | `reshape`           | :white_check_mark: |            | Partial implementation       |
-|                          | `roll`              | :white_check_mark: |            |                              |
+|                          | `roll`              | :x:                | 2          | Use `concat` and `reshape`, [#115](https://github.com/tomwhite/cubed/issues/115) |
 |                          | `squeeze`           | :white_check_mark: |            |                              |
 |                          | `stack`             | :white_check_mark: |            |                              |
-|                          | `tile`              | :white_check_mark: | 2023.12    |                              |
-|                          | `unstack`           | :white_check_mark: | 2023.12    |                              |
 | Searching Functions      | `argmax`            | :white_check_mark: |            |                              |
 |                          | `argmin`            | :white_check_mark: |            |                              |
-|                          | `count_nonzero`     | :white_check_mark: | 2024.12    |                              |
-|                          | `nonzero`           | :x:                |            | Shape is data dependent      |
-|                          | `searchsorted`      | :white_check_mark: | 2023.12    |                              |
+|                          | `nonzero`           | :x:                | 3          | Shape is data dependent      |
 |                          | `where`             | :white_check_mark: |            |                              |
-| Set Functions            | `isin`              | :white_check_mark: | 2025.12    |                              |
-|                          | `unique_all`        | :x:                |            | Shape is data dependent      |
-|                          | `unique_counts`     | :x:                |            | Shape is data dependent      |
-|                          | `unique_inverse`    | :x:                |            | Shape is data dependent      |
-|                          | `unique_values`     | :x:                |            | Shape is data dependent      |
-| Sorting Functions        | `argsort`           | :x:                |            |                              |
-|                          | `sort`              | :x:                |            |                              |
-| Statistical Functions    | `cumulative_prod`   | :white_check_mark: | 2024.12    |                              |
-|                          | `cumulative_sum`    | :white_check_mark: | 2023.12    |                              |
-|                          | `max`               | :white_check_mark: |            |                              |
+| Set Functions            | `unique_all`        | :x:                | 3          | Shape is data dependent      |
+|                          | `unique_counts`     | :x:                | 3          | Shape is data dependent      |
+|                          | `unique_inverse`    | :x:                | 3          | Shape is data dependent      |
+|                          | `unique_values`     | :x:                | 3          | Shape is data dependent      |
+| Sorting Functions        | `argsort`           | :x:                | 3          | Not in Dask                  |
+|                          | `sort`              | :x:                | 3          | Not in Dask                  |
+| Statistical Functions    | `max`               | :white_check_mark: |            |                              |
 |                          | `mean`              | :white_check_mark: |            |                              |
 |                          | `min`               | :white_check_mark: |            |                              |
 |                          | `prod`              | :white_check_mark: |            |                              |
-|                          | `std`               | :white_check_mark: |            |                              |
+|                          | `std`               | :x:                | 2          | Like `mean`, [#29](https://github.com/tomwhite/cubed/issues/29) |
 |                          | `sum`               | :white_check_mark: |            |                              |
-|                          | `var`               | :white_check_mark: |            |                              |
+|                          | `var`               | :x:                | 2          | Like `mean`, [#29](https://github.com/tomwhite/cubed/issues/29) |
 | Utility Functions        | `all`               | :white_check_mark: |            |                              |
 |                          | `any`               | :white_check_mark: |            |                              |
-|                          | `diff`              | :white_check_mark: | 2024.12    |                              |
-
-### Linear Algebra Extension
-
-A few of the [linear algebra extension](https://data-apis.org/array-api/2025.12/extensions/linear_algebra_functions.html) functions are supported, as indicated in this table.
-
-| Category                 | Object/Function     | Implemented        | Version    | Notes                        |
-| ------------------------ | ------------------- | ------------------ | ---------- | ---------------------------- |
-| Linear Algebra Functions | `cholesky`          | :x:                |            |                              |
-|                          | `cross`             | :x:                |            |                              |
-|                          | `det`               | :x:                |            |                              |
-|                          | `diagonal`          | :x:                |            |                              |
-|                          | `eig`               | :x:                |            |                              |
-|                          | `eigh`              | :x:                |            |                              |
-|                          | `eigvals`           | :x:                |            |                              |
-|                          | `eigvalsh`          | :x:                |            |                              |
-|                          | `inv`               | :x:                |            |                              |
-|                          | `matmul`            | :white_check_mark: |            |                              |
-|                          | `matrix_norm`       | :x:                |            |                              |
-|                          | `matrix_power`      | :x:                |            |                              |
-|                          | `matrix_rank`       | :x:                |            |                              |
-|                          | `matrix_transpose`  | :white_check_mark: |            |                              |
-|                          | `outer`             | :white_check_mark: |            |                              |
-|                          | `pinv`              | :x:                |            |                              |
-|                          | `qr`                | :white_check_mark: |            |                              |
-|                          | `slogdet`           | :x:                |            |                              |
-|                          | `solve`             | :x:                |            |                              |
-|                          | `svd`               | :white_check_mark: |            |                              |
-|                          | `svdvals`           | :white_check_mark: |            |                              |
-|                          | `tensordot`         | :white_check_mark: |            |                              |
-|                          | `trace`             | :x:                |            |                              |
-|                          | `vecdot`            | :white_check_mark: |            |                              |
-|                          | `vectornorm`        | :x:                |            |                              |

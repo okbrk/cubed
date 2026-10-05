@@ -1,0 +1,4 @@
+cubed
+lithops[gcp]
+gcsfs
+tqdm

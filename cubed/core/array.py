@@ -1,18 +1,18 @@
-import math
-from functools import reduce
+from dataclasses import dataclass
 from operator import mul
-from typing import Literal, TypeVar
+from typing import Optional, TypeVar, Union
+from warnings import warn
 
-from cubed import config
-from cubed.backend_array_api import namespace as nxp
-from cubed.backend_array_api import numpy_array_to_backend_array
-from cubed.runtime.create import create_executor
-from cubed.runtime.types import Callback, Executor
-from cubed.spec import Spec, spec_from_config
+import numpy as np
+from toolz import map, reduce
+
+from cubed.runtime.pipeline import already_computed
+from cubed.runtime.types import Executor
 from cubed.storage.zarr import open_if_lazy_zarr_array
-from cubed.utils import array_memory, itemsize, normalize_chunks
+from cubed.utils import chunk_memory, convert_to_bytes
+from cubed.vendor.dask.array.core import normalize_chunks
 
-from .plan import FinalizedPlan, arrays_to_plan
+from .plan import arrays_to_plan
 
 sym_counter = 0
 
@@ -43,21 +43,27 @@ class CoreArray:
         self._chunks = normalize_chunks(
             zarray.chunks, shape=self.shape, dtype=self.dtype
         )
-        # get spec from config if not supplied
-        self.spec = spec or spec_from_config(config)
-        self._plan = plan
+        # if no spec is supplied, use a default with local temp dir,
+        # and a modest amount of memory (200MB, of which 100MB is reserved)
+        self.spec = spec or Spec(
+            None, allowed_mem=200_000_000, reserved_mem=100_000_000
+        )
+        self.plan = plan
 
     @property
-    def blocks(self):
-        """An array-like interface to the blocks of an array."""
-        from cubed.core.indexing import BlockView
+    def zarray_maybe_lazy(self):
+        """The underlying Zarr array or LazyZarrArray. Use this during planning, before the computation has started."""
+        return self._zarray
 
-        return BlockView(self)
+    @property
+    def zarray(self):
+        """The underlying Zarr array. May only be used during the computation once the array has been created."""
+        return open_if_lazy_zarr_array(self._zarray)
 
     @property
     def chunkmem(self):
         """Amount of memory in bytes that a single chunk uses."""
-        return array_memory(self.dtype, self.chunksize)
+        return chunk_memory(self.dtype, self.chunksize)
 
     @property
     def chunksize(self):
@@ -102,32 +108,21 @@ class CoreArray:
     @property
     def nbytes(self) -> int:
         """Number of bytes in array"""
-        return self.size * itemsize(self.dtype)
-
-    @property
-    def cbytes(self) -> int:
-        """Number of bytes in a chunk"""
-        return math.prod(self.chunksize) * itemsize(self.dtype)
-
-    @property
-    def nchunks(self) -> int:
-        """Number of chunks in array"""
-        return reduce(mul, self.numblocks, 1)
+        return self.size * self.dtype.itemsize
 
     @property
     def itemsize(self) -> int:
         """Length of one array element in bytes"""
-        return itemsize(self.dtype)
+        return self.dtype.itemsize
 
     def _read_stored(self):
         # Only works if the array has been computed
         if self.size > 0:
             # read back from zarr
-            zarray = open_if_lazy_zarr_array(self._zarray)
-            return numpy_array_to_backend_array(zarray[...])
+            return self.zarray[...]
         else:
             # this case fails for zarr, so just return an empty array of the correct shape
-            return nxp.empty(self.shape, dtype=self.dtype)
+            return np.empty(self.shape, dtype=self.dtype)
 
     def compute(
         self,
@@ -135,58 +130,22 @@ class CoreArray:
         executor=None,
         callbacks=None,
         optimize_graph=True,
-        optimize_function=None,
         resume=None,
         **kwargs,
     ):
-        """Compute this array, and any arrays that it depends on.
-
-        Parameters
-        ----------
-        executor : Executor, optional
-            The executor to use to run the computation. If not set then the executor
-            from the array's ``Spec`` is used.
-        callbacks : list of Callback, optional
-            Callbacks to send events to while running the computation.
-        optimize_graph : bool, optional
-            If True, the graph is optimized before running the computation.
-            Otherwise, the graph is computed as is. Default is True.
-        optimize_function : callable, optional
-            Function to optimize the computation graph. Default is to use a
-            function that performs map fusion only.
-        resume : bool, optional
-            If True, intermediate arrays that have already been computed won't be
-            recomputed. Default is False.
-        """
+        """Compute this array, and any arrays that it depends on."""
         result = compute(
             self,
             executor=executor,
             callbacks=callbacks,
             optimize_graph=optimize_graph,
-            optimize_function=optimize_function,
             resume=resume,
             **kwargs,
         )
         if result:
             return result[0]
 
-    def plan(
-        self,
-        *,
-        optimize_graph=True,
-        optimize_function=None,
-        compile_function=None,
-    ) -> FinalizedPlan:
-        return plan(
-            self,
-            optimize_graph=optimize_graph,
-            optimize_function=optimize_function,
-            compile_function=compile_function,
-        )
-
-    def rechunk(
-        self: T_ChunkedArray, chunks, *, min_mem=None, allow_irregular=True
-    ) -> T_ChunkedArray:
+    def rechunk(self: T_ChunkedArray, chunks) -> T_ChunkedArray:
         """Change the chunking of this array without changing its shape or data.
 
         Parameters
@@ -201,17 +160,9 @@ class CoreArray:
         """
         from cubed.core.ops import rechunk
 
-        return rechunk(self, chunks, min_mem=min_mem, allow_irregular=allow_irregular)
+        return rechunk(self, chunks)
 
-    def visualize(
-        self,
-        filename="cubed",
-        format=None,
-        optimize_graph=True,
-        optimize_function=None,
-        show_hidden=False,
-        engine: Literal["cytoscape", "graphviz"] | None = None,
-    ):
+    def visualize(self, filename="cubed", format=None, optimize_graph=True):
         """Produce a visualization of the computation graph for this array.
 
         Parameters
@@ -224,12 +175,6 @@ class CoreArray:
         optimize_graph : bool, optional
             If True, the graph is optimized before rendering.  Otherwise,
             the graph is displayed as is. Default is True.
-        optimize_function : callable, optional
-            Function to optimize the computation graph. Default is to use a
-            function that performs map fusion only.
-        show_hidden : bool
-            If True, show arrays and operations that are marked as hidden in the
-            visualization. Default is False.
 
         Returns
         -------
@@ -238,22 +183,201 @@ class CoreArray:
             in a notebook), otherwise None.
         """
         return visualize(
-            self,
-            filename=filename,
-            format=format,
-            optimize_graph=optimize_graph,
-            optimize_function=optimize_function,
-            show_hidden=show_hidden,
-            engine=engine,
+            self, filename=filename, format=format, optimize_graph=optimize_graph
         )
 
     def __getitem__(self: T_ChunkedArray, key, /) -> T_ChunkedArray:
-        from cubed.core.indexing import index
+        from cubed.core.ops import index
 
         return index(self, key)
 
+    def __setitem__(self, key, value):
+        if isinstance(value, CoreArray) and value.ndim != 0:
+            raise NotImplementedError(
+                "Calling __setitem__ on an array with more than 0 dimensions is not supported."
+            )
+
+        nodes = {n: d for (n, d) in self.plan.dag.nodes(data=True)}
+        if not already_computed(nodes[self.name]):
+            raise NotImplementedError(
+                "Calling __setitem__ on an array that has not been computed is not supported."
+            )
+
+        self.zarray.__setitem__(key, value)
+
     def __repr__(self):
         return f"cubed.core.CoreArray<{self.name}, shape={self.shape}, dtype={self.dtype}, chunks={self.chunks}>"
+
+
+class Spec:
+    """Specification of resources available to run a computation."""
+
+    def __init__(
+        self,
+        work_dir: Union[str, None] = None,
+        max_mem: Union[int, None] = None,
+        allowed_mem: Union[int, str, None] = None,
+        reserved_mem: Union[int, str, None] = 0,
+        executor: Union[Executor, None] = None,
+        storage_options: Union[dict, None] = None,
+    ):
+        """
+        Specify resources available to run a computation.
+
+        Parameters
+        ----------
+        work_dir : str or None
+            The directory path (specified as an fsspec URL) used for storing intermediate data.
+        max_mem : int, optional
+            **Deprecated**. The maximum memory available to a worker for data use for the computation, in bytes.
+        allowed_mem : int or str, optional
+            The total memory available to a worker for running a task, in bytes.
+
+            If int it should be >=0. If str it should be of form <value><unit> where unit can be kB, MB, GB, TB etc.
+            This includes any ``reserved_mem`` that has been set.
+        reserved_mem : int or str, optional
+            The memory reserved on a worker for non-data use when running a task, in bytes.
+
+            If int it should be >=0. If str it should be of form <value><unit> where unit can be kB, MB, GB, TB etc.
+        executor : Executor, optional
+            The default executor for running computations.
+        storage_options : dict, optional
+            Storage options to be passed to fsspec.
+        """
+
+        if max_mem is not None:
+            warn(
+                "`max_mem` is deprecated, please use `allowed_mem` instead",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
+        self._work_dir = work_dir
+
+        self._reserved_mem = convert_to_bytes(reserved_mem or 0)
+        if allowed_mem is None:
+            self._allowed_mem = (max_mem or 0) + self.reserved_mem
+        else:
+            self._allowed_mem = convert_to_bytes(allowed_mem)
+
+        self._executor = executor
+        self._storage_options = storage_options
+
+    @property
+    def work_dir(self) -> Optional[str]:
+        """The directory path (specified as an fsspec URL) used for storing intermediate data."""
+        return self._work_dir
+
+    @property
+    def allowed_mem(self) -> int:
+        """
+        The total memory available to a worker for running a task, in bytes.
+
+        This includes any ``reserved_mem`` that has been set.
+        """
+        return self._allowed_mem
+
+    @property
+    def reserved_mem(self) -> int:
+        """
+        The memory reserved on a worker for non-data use when running a task, in bytes.
+
+        See Also
+        --------
+        cubed.measure_reserved_mem
+        """
+        return self._reserved_mem
+
+    @property
+    def executor(self) -> Optional[Executor]:
+        """The default executor for running computations."""
+        return self._executor
+
+    @property
+    def storage_options(self) -> Optional[dict]:
+        """Storage options to be passed to fsspec."""
+        return self._storage_options
+
+    def __repr__(self) -> str:
+        return (
+            f"cubed.Spec(work_dir={self._work_dir}, allowed_mem={self._allowed_mem}, "
+            f"reserved_mem={self._reserved_mem}, executor={self._executor}, storage_options={self._storage_options})"
+        )
+
+    def __eq__(self, other):
+        if isinstance(other, Spec):
+            return (
+                self.work_dir == other.work_dir
+                and self.allowed_mem == other.allowed_mem
+                and self.reserved_mem == other.reserved_mem
+                and self.executor == other.executor
+                and self.storage_options == other.storage_options
+            )
+        else:
+            return False
+
+
+class Callback:
+    """Object to receive callback events during array computation."""
+
+    def on_compute_start(self, dag, resume):
+        """Called when the computation is about to start.
+
+        Parameters
+        ----------
+        dag : networkx.MultiDiGraph
+            The computation DAG.
+        """
+        pass  # pragma: no cover
+
+    def on_compute_end(self, dag):
+        """Called when the computation has finished.
+
+        Parameters
+        ----------
+        dag : networkx.MultiDiGraph
+            The computation DAG.
+        """
+        pass  # pragma: no cover
+
+    def on_task_end(self, event):
+        """Called when the a task ends.
+
+        Parameters
+        ----------
+        event : TaskEndEvent
+            Information about the task execution.
+        """
+        pass  # pragma: no cover
+
+
+@dataclass
+class TaskEndEvent:
+    """Callback information about a completed task (or tasks)."""
+
+    array_name: str
+    """Name of the array that the task is for."""
+
+    num_tasks: int = 1
+    """Number of tasks that this event applies to (default 1)."""
+
+    task_create_tstamp: Optional[float] = None
+    """Timestamp of when the task was created by the client."""
+
+    function_start_tstamp: Optional[float] = None
+    """Timestamp of when the function started executing on the remote worker."""
+
+    function_end_tstamp: Optional[float] = None
+    """Timestamp of when the function finished executing on the remote worker."""
+
+    task_result_tstamp: Optional[float] = None
+    """Timestamp of when the result of the task was received by the client."""
+
+    peak_measured_mem_start: Optional[int] = None
+    """Peak memory usage measured on the remote worker before the function starts executing."""
+
+    peak_measured_mem_end: Optional[int] = None
+    """Peak memory usage measured on the remote worker after the function finishes executing."""
 
 
 def check_array_specs(arrays):
@@ -270,63 +394,26 @@ def compute(
     executor=None,
     callbacks=None,
     optimize_graph=True,
-    optimize_function=None,
     resume=None,
     **kwargs,
 ):
-    """Compute multiple arrays at once.
-
-    Parameters
-    ----------
-    arrays : cubed.CoreArray
-        The arrays to compute.
-    executor : Executor, optional
-        The executor to use to run the computation. If not set then the executor
-        from the ``Spec`` from the arrays is used.
-    callbacks : list of Callback, optional
-        Callbacks to send events to while running the computation.
-    optimize_graph : bool, optional
-        If True, the graph is optimized before running the computation.
-        Otherwise, the graph is computed as is. Default is True.
-    optimize_function : callable, optional
-        Function to optimize the computation graph. Default is to use a
-        function that performs map fusion only.
-    resume : bool, optional
-        If True, intermediate arrays that have already been computed won't be
-        recomputed. Default is False.
-    """
+    """Compute multiple arrays at once."""
     spec = check_array_specs(arrays)  # guarantees all arrays have same spec
-    compile_function = kwargs.pop("compile_function", None)
-    finalized_plan = plan(
-        *arrays,
-        optimize_graph=optimize_graph,
-        optimize_function=optimize_function,
-        compile_function=compile_function,
-    )
+    plan = arrays_to_plan(*arrays)
     if executor is None:
-        from cubed import config
+        executor = arrays[0].spec.executor
+        if executor is None:
+            from cubed.runtime.executors.python import PythonDagExecutor
 
-        if "executor_name" in config:
-            # see e.g. raise-if-computes executor
-            executor = create_executor(config["executor_name"])
-        else:
-            executor = spec.executor
-            if executor is None:
-                executor = create_executor("threads", spec.executor_options)
-
-    # combine any callbacks specified as args with any active callbacks from the context manager
-    if callbacks is None and len(Callback.active) == 0:
-        all_callbacks = None
-    else:
-        all_callbacks = list(Callback.active)
-        if callbacks is not None:
-            all_callbacks.extend(callbacks)
+            executor = PythonDagExecutor()
 
     _return_in_memory_array = kwargs.pop("_return_in_memory_array", True)
-    finalized_plan.execute(
+    plan.execute(
         executor=executor,
-        callbacks=all_callbacks,
+        callbacks=callbacks,
+        optimize_graph=optimize_graph,
         resume=resume,
+        array_names=[a.name for a in arrays],
         spec=spec,
         **kwargs,
     )
@@ -335,15 +422,7 @@ def compute(
         return tuple(a._read_stored() for a in arrays)
 
 
-def visualize(
-    *arrays,
-    filename="cubed",
-    format=None,
-    optimize_graph=True,
-    optimize_function=None,
-    show_hidden=False,
-    engine: Literal["cytoscape", "graphviz"] | None = None,
-):
+def visualize(*arrays, filename="cubed", format=None, optimize_graph=True):
     """Produce a visualization of the computation graph for multiple arrays.
 
     Parameters
@@ -358,12 +437,6 @@ def visualize(
     optimize_graph : bool, optional
         If True, the graph is optimized before rendering.  Otherwise,
         the graph is displayed as is. Default is True.
-    optimize_function : callable, optional
-        Function to optimize the computation graph. Default is to use a
-        function that performs map fusion only.
-    show_hidden : bool
-        If True, show arrays and operations that are marked as hidden in the
-        visualization. Default is False.
 
     Returns
     -------
@@ -371,29 +444,9 @@ def visualize(
         An IPython SVG image if IPython can be imported (for rendering
         in a notebook), otherwise None.
     """
-    finalized_plan = plan(
-        *arrays,
-        optimize_graph=optimize_graph,
-        optimize_function=optimize_function,
-    )
-    return finalized_plan.visualize(
-        filename=filename,
-        format=format,
-        show_hidden=show_hidden,
-        engine=engine,
-    )
-
-
-def plan(
-    *arrays,
-    optimize_graph=True,
-    optimize_function=None,
-    compile_function=None,
-) -> FinalizedPlan:
-    return arrays_to_plan(*arrays)._finalize(
-        optimize_graph=optimize_graph,
-        optimize_function=optimize_function,
-        compile_function=compile_function,
+    plan = arrays_to_plan(*arrays)
+    return plan.visualize(
+        filename=filename, format=format, optimize_graph=optimize_graph
     )
 
 
@@ -402,8 +455,19 @@ class PeakMeasuredMemoryCallback(Callback):
         self.peak_measured_mem = event.peak_measured_mem_end
 
 
+def measure_reserved_memory(
+    executor: Executor, work_dir: Optional[str] = None, **kwargs
+) -> int:
+    warn(
+        "`measure_reserved_memory` is deprecated, please use `measure_reserved_mem` instead",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return measure_reserved_mem(executor, work_dir=work_dir, **kwargs)
+
+
 def measure_reserved_mem(
-    executor: Executor, work_dir: str | None = None, **kwargs
+    executor: Executor, work_dir: Optional[str] = None, **kwargs
 ) -> int:
     """Measures the reserved memory use for a given executor runtime.
 
@@ -424,7 +488,7 @@ def measure_reserved_mem(
         reports peak memory, such as Lithops or Modal.
 
     work_dir : str or None, optional
-        The directory path (specified as an fsspec or obstore URL) used for storing intermediate data.
+        The directory path (specified as an fsspec URL) used for storing intermediate data.
         This is required when using a cloud runtime.
 
     kwargs

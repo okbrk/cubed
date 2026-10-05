@@ -1,10 +1,8 @@
 __all__ = []
 
-__array_api_version__ = "2025.12"
+__array_api_version__ = "2021.12"
 
-from .inspection import __array_namespace_info__
-
-__all__ += ["__array_api_version__", "__array_namespace_info__"]
+__all__ += ["__array_api_version__"]
 
 from .array_object import Array
 
@@ -50,14 +48,12 @@ __all__ += [
     "zeros_like",
 ]
 
-from .data_type_functions import astype, can_cast, finfo, iinfo, isdtype, result_type
+from .data_type_functions import astype, can_cast, finfo, iinfo, result_type
 
-__all__ += ["astype", "can_cast", "finfo", "iinfo", "isdtype", "result_type"]
+__all__ += ["astype", "can_cast", "finfo", "iinfo", "result_type"]
 
 from .dtypes import (
     bool,
-    complex64,
-    complex128,
     float32,
     float64,
     int8,
@@ -72,8 +68,6 @@ from .dtypes import (
 
 __all__ += [
     "bool",
-    "complex64",
-    "complex128",
     "float32",
     "float64",
     "int8",
@@ -103,9 +97,6 @@ from .elementwise_functions import (
     bitwise_right_shift,
     bitwise_xor,
     ceil,
-    clip,
-    conj,
-    copysign,
     cos,
     cosh,
     divide,
@@ -116,8 +107,6 @@ from .elementwise_functions import (
     floor_divide,
     greater,
     greater_equal,
-    hypot,
-    imag,
     isfinite,
     isinf,
     isnan,
@@ -132,20 +121,14 @@ from .elementwise_functions import (
     logical_not,
     logical_or,
     logical_xor,
-    maximum,
-    minimum,
     multiply,
     negative,
-    nextafter,
     not_equal,
     positive,
     pow,
-    real,
-    reciprocal,
     remainder,
     round,
     sign,
-    signbit,
     sin,
     sinh,
     sqrt,
@@ -173,9 +156,6 @@ __all__ += [
     "bitwise_right_shift",
     "bitwise_xor",
     "ceil",
-    "clip",
-    "conj",
-    "copysign",
     "cos",
     "cosh",
     "divide",
@@ -186,8 +166,6 @@ __all__ += [
     "floor_divide",
     "greater",
     "greater_equal",
-    "hypot",
-    "imag",
     "isfinite",
     "isinf",
     "isnan",
@@ -202,20 +180,14 @@ __all__ += [
     "logical_not",
     "logical_or",
     "logical_xor",
-    "maximum",
-    "minimum",
     "multiply",
-    "nextafter",
     "negative",
     "not_equal",
     "positive",
     "pow",
-    "real",
-    "reciprocal",
     "remainder",
     "round",
     "sign",
-    "signbit",
     "sin",
     "sinh",
     "sqrt",
@@ -230,78 +202,40 @@ from .indexing_functions import take
 
 __all__ += ["take"]
 
-from .linear_algebra_functions import matmul, matrix_transpose, tensordot, vecdot
+from .linear_algebra_functions import matmul, matrix_transpose, outer, tensordot, vecdot
 
-__all__ += ["matmul", "matrix_transpose", "tensordot", "vecdot"]
+__all__ += ["matmul", "matrix_transpose", "outer", "tensordot", "vecdot"]
 
 from .manipulation_functions import (
     broadcast_arrays,
-    broadcast_shapes,
     broadcast_to,
     concat,
     expand_dims,
-    flip,
-    moveaxis,
     permute_dims,
-    repeat,
     reshape,
-    roll,
     squeeze,
     stack,
-    tile,
-    unstack,
 )
 
 __all__ += [
     "broadcast_arrays",
-    "broadcast_shapes",
     "broadcast_to",
     "concat",
     "expand_dims",
-    "flip",
-    "moveaxis",
     "permute_dims",
-    "repeat",
     "reshape",
-    "roll",
     "squeeze",
     "stack",
-    "tile",
-    "unstack",
 ]
 
-from .searching_functions import argmax, argmin, count_nonzero, searchsorted, where
+from .searching_functions import argmax, argmin, where
 
-__all__ += ["argmax", "argmin", "count_nonzero", "searchsorted", "where"]
+__all__ += ["argmax", "argmin", "where"]
 
-from .set_functions import isin
+from .statistical_functions import max, mean, min, prod, sum
 
-__all__ += ["isin"]
+__all__ += ["max", "mean", "min", "prod", "sum"]
 
-from .statistical_functions import (
-    cumulative_prod,
-    cumulative_sum,
-    max,
-    mean,
-    min,
-    prod,
-    std,
-    sum,
-    var,
-)
+from .utility_functions import all, any
 
-__all__ += [
-    "cumulative_prod",
-    "cumulative_sum",
-    "max",
-    "mean",
-    "min",
-    "prod",
-    "std",
-    "sum",
-    "var",
-]
-
-from .utility_functions import all, any, diff
-
-__all__ += ["all", "any", "diff"]
+__all__ += ["all", "any"]

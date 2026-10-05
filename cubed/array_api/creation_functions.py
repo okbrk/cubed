@@ -1,18 +1,15 @@
-import math
-from collections.abc import Iterable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterable, List
 
-from cubed.array_api import __array_namespace_info__
-from cubed.backend_array_api import namespace as nxp
-from cubed.core import Plan, gensym
-from cubed.core.ops import map_blocks
-from cubed.storage.virtual import (
-    virtual_empty,
-    virtual_full,
-    virtual_in_memory,
-    virtual_offsets,
-)
-from cubed.utils import normalize_chunks, normalize_shape, to_chunksize
+import numpy as np
+from zarr.util import normalize_shape
+
+from cubed.core import Plan, gensym, map_blocks
+from cubed.core.ops import map_direct
+from cubed.core.plan import new_temp_path
+from cubed.storage.virtual import virtual_offsets
+from cubed.storage.zarr import lazy_from_array, lazy_full
+from cubed.utils import to_chunksize
+from cubed.vendor.dask.array.core import normalize_chunks
 
 if TYPE_CHECKING:
     from .array_object import Array
@@ -23,31 +20,33 @@ def arange(
 ) -> "Array":
     if stop is None:
         start, stop = 0, start
-    num = int(max(math.ceil((stop - start) / step), 0))
+    num = int(max(np.ceil((stop - start) / step), 0))
     if dtype is None:
-        dtype = nxp.arange(start, stop, step * num if num else step).dtype
-
+        dtype = np.arange(start, stop, step * num if num else step).dtype
     chunks = normalize_chunks(chunks, shape=(num,), dtype=dtype)
     chunksize = chunks[0][0]
-
-    return map_blocks(
+    numblocks = len(chunks[0])
+    # create small array of block numbers
+    out = asarray(np.arange(numblocks), chunks=(1,), spec=spec)
+    # then map each block to partial arange
+    out = map_blocks(
         _arange,
+        out,
         dtype=dtype,
         chunks=chunks,
-        spec=spec,
         size=chunksize,
         start=start,
         stop=stop,
         step=step,
-        arange_dtype=dtype,
     )
+    return out
 
 
-def _arange(x, size, start, stop, step, arange_dtype, block_id=None):
-    i = block_id[0]
+def _arange(a, size, start, stop, step):
+    i = a[0]
     blockstart = start + (i * size * step)
     blockstop = start + ((i + 1) * size * step)
-    return nxp.arange(blockstart, min(blockstop, stop), step, dtype=arange_dtype)
+    return np.arange(blockstart, min(blockstop, stop), step)
 
 
 def asarray(
@@ -64,104 +63,90 @@ def asarray(
     ):  # pragma: no cover
         return asarray(a.data)
     elif not isinstance(getattr(a, "shape", None), Iterable):
-        a = nxp.asarray(a, dtype=dtype)
-
+        # ensure blocks are arrays
+        a = np.asarray(a, dtype=dtype)
     if dtype is None:
         dtype = a.dtype
 
+    # write to zarr
     chunksize = to_chunksize(normalize_chunks(chunks, shape=a.shape, dtype=dtype))
     name = gensym()
-    target = virtual_in_memory(a, chunks=chunksize)
+    zarr_path = new_temp_path(name=name, spec=spec)
+    target = lazy_from_array(a, dtype=dtype, chunks=chunksize, store=zarr_path)
 
-    scalar_value = str(a) if a.shape == () else None
-    plan = Plan._new(name, "asarray", target, scalar_value=scalar_value)
+    plan = Plan._new(name, "asarray", target)
     return Array(name, target, spec, plan)
 
 
 def empty(shape, *, dtype=None, device=None, chunks="auto", spec=None) -> "Array":
-    shape = normalize_shape(shape)
-    return empty_virtual_array(
-        shape, dtype=dtype, device=device, chunks=chunks, spec=spec, hidden=False
-    )
+    if dtype is None:
+        dtype = np.float64
+    return full(shape, None, dtype=dtype, device=device, chunks=chunks, spec=spec)
 
 
 def empty_like(x, /, *, dtype=None, device=None, chunks=None, spec=None) -> "Array":
     return empty(**_like_args(x, dtype, device, chunks, spec))
 
 
-def empty_virtual_array(
-    shape, *, dtype=None, device=None, chunks="auto", spec=None, hidden=True
-) -> "Array":
-    dtypes = __array_namespace_info__().default_dtypes(device=device)
-    if dtype is None:
-        dtype = dtypes["real floating"]
-
-    chunksize = to_chunksize(normalize_chunks(chunks, shape=shape, dtype=dtype))
-    name = gensym()
-    target = virtual_empty(shape, dtype=dtype, chunks=chunksize)
-
-    from .array_object import Array
-
-    plan = Plan._new(name, "empty", target, hidden=hidden)
-    return Array(name, target, spec, plan)
-
-
 def eye(
     n_rows, n_cols=None, /, *, k=0, dtype=None, device=None, chunks="auto", spec=None
 ) -> "Array":
-    dtypes = __array_namespace_info__().default_dtypes(device=device)
     if n_cols is None:
         n_cols = n_rows
     if dtype is None:
-        dtype = dtypes["real floating"]
+        dtype = np.float64
 
     shape = (n_rows, n_cols)
     chunks = normalize_chunks(chunks, shape=shape, dtype=dtype)
-    vchunksize, hchunksize = to_chunksize(chunks)
+    chunksize = to_chunksize(chunks)[0]
 
-    # chunksize must be same for rows and cols for current implementation
-    chunksize = min(vchunksize, hchunksize)
-    chunks = normalize_chunks((chunksize, chunksize), shape=shape, dtype=dtype)
-
-    return map_blocks(
+    return map_direct(
         _eye,
+        shape=shape,
         dtype=dtype,
         chunks=chunks,
+        extra_projected_mem=0,
         spec=spec,
         k=k,
         chunksize=chunksize,
     )
 
 
-def _eye(x, k=None, chunksize=None, block_id=None):
+def _eye(x, *arrays, k=None, chunksize=None, block_id=None):
     i, j = block_id
     bk = (j - i) * chunksize
     if bk - chunksize <= k <= bk + chunksize:
-        return nxp.eye(x.shape[0], x.shape[1], k=k - bk, dtype=x.dtype)
+        return np.eye(x.shape[0], x.shape[1], k=k - bk, dtype=x.dtype)
     else:
-        return nxp.zeros_like(x)
+        return np.zeros_like(x)
 
 
 def full(
     shape, fill_value, *, dtype=None, device=None, chunks="auto", spec=None
 ) -> "Array":
-    dtypes = __array_namespace_info__().default_dtypes(device=device)
+    # write to zarr
+    # note that write_empty_chunks=False means no chunks are written to disk, so it is very efficient to create large arrays
     shape = normalize_shape(shape)
     if dtype is None:
-        # check bool first since True/False are instances of int and float
-        if isinstance(fill_value, bool):
-            dtype = nxp.bool
-        elif isinstance(fill_value, int):
-            dtype = dtypes["integral"]
+        if isinstance(fill_value, int):
+            dtype = np.int64
         elif isinstance(fill_value, float):
-            dtype = dtypes["real floating"]
-        elif isinstance(fill_value, complex):
-            dtype = dtypes["complex floating"]
+            dtype = np.float64
+        elif isinstance(fill_value, bool):
+            dtype = np.bool_
         else:
             raise TypeError("Invalid input to full")
     chunksize = to_chunksize(normalize_chunks(chunks, shape=shape, dtype=dtype))
     name = gensym()
-    target = virtual_full(shape, fill_value, dtype=dtype, chunks=chunksize)
+    zarr_path = new_temp_path(name=name, spec=spec)
+    target = lazy_full(
+        shape,
+        fill_value,
+        dtype=dtype,
+        chunks=chunksize,
+        store=zarr_path,
+        write_empty_chunks=False,
+    )
 
     from .array_object import Array
 
@@ -169,13 +154,13 @@ def full(
     return Array(name, target, spec, plan)
 
 
-def offsets_virtual_array(shape, spec=None) -> "Array":
+def offsets_array(shape, spec=None) -> "Array":
     name = gensym()
     target = virtual_offsets(shape)
 
     from .array_object import Array
 
-    plan = Plan._new(name, "block_ids", target, hidden=True)
+    plan = Plan._new(name, "block_ids", target)
     return Array(name, target, spec, plan)
 
 
@@ -197,50 +182,47 @@ def linspace(
     chunks="auto",
     spec=None,
 ) -> "Array":
-    dtypes = __array_namespace_info__().default_dtypes(device=device)
-
     range_ = stop - start
     div = (num - 1) if endpoint else num
     if div == 0:
         div = 1
     step = float(range_) / div
+    shape = (num,)
     if dtype is None:
-        dtype = dtypes["real floating"]
-    chunks = normalize_chunks(chunks, shape=(num,), dtype=dtype)
+        dtype = np.float64
+    chunks = normalize_chunks(chunks, shape=shape, dtype=dtype)
     chunksize = chunks[0][0]
 
     if num == 0:
         return asarray(0.0, dtype=dtype, spec=spec)
 
-    return map_blocks(
+    return map_direct(
         _linspace,
+        shape=shape,
         dtype=dtype,
         chunks=chunks,
+        extra_projected_mem=0,
         spec=spec,
         size=chunksize,
         start=start,
         step=step,
         endpoint=endpoint,
         linspace_dtype=dtype,
-        device=device,
     )
 
 
-def _linspace(
-    x, size, start, step, endpoint, linspace_dtype, device=None, block_id=None
-):
+def _linspace(x, *arrays, size, start, step, endpoint, linspace_dtype, block_id=None):
     bs = x.shape[0]
     i = block_id[0]
     adjusted_bs = bs - 1 if endpoint else bs
-
     blockstart = start + (i * size * step)
-    blockstop = blockstart + adjusted_bs * step
-    return nxp.linspace(
+    blockstop = blockstart + (adjusted_bs * step)
+    return np.linspace(
         blockstart, blockstop, bs, endpoint=endpoint, dtype=linspace_dtype
     )
 
 
-def meshgrid(*arrays, indexing="xy") -> list["Array"]:
+def meshgrid(*arrays, indexing="xy") -> List["Array"]:
     if len({a.dtype for a in arrays}) > 1:
         raise ValueError("meshgrid inputs must all have the same dtype")
 
@@ -268,14 +250,12 @@ def meshgrid(*arrays, indexing="xy") -> list["Array"]:
     if indexing == "xy" and len(arrs) > 1:
         grid[0], grid[1] = grid[1], grid[0]
 
-    return tuple(grid)
+    return grid
 
 
 def ones(shape, *, dtype=None, device=None, chunks="auto", spec=None) -> "Array":
-    dtypes = __array_namespace_info__().default_dtypes(device=device)
-
     if dtype is None:
-        dtype = dtypes["real floating"]
+        dtype = np.float64
     return full(shape, 1, dtype=dtype, device=device, chunks=chunks, spec=spec)
 
 
@@ -320,10 +300,8 @@ def _tri_mask(N, M, k, chunks, spec):
 
 
 def zeros(shape, *, dtype=None, device=None, chunks="auto", spec=None) -> "Array":
-    dtypes = __array_namespace_info__().default_dtypes(device=device)
-
     if dtype is None:
-        dtype = dtypes["real floating"]
+        dtype = np.float64
     return full(shape, 0, dtype=dtype, device=device, chunks=chunks, spec=spec)
 
 

@@ -1,7 +1,5 @@
-from itertools import chain
-
 import numpy as np
-from tlz import merge, unique
+from tlz import concat, merge, unique
 
 from cubed.vendor.dask.array.gufunc import _parse_gufunc_signature
 
@@ -12,11 +10,9 @@ def apply_gufunc(
     *args,
     axes=None,
     axis=None,
-    keepdims=False,
     output_dtypes=None,
     output_sizes=None,
     vectorize=None,
-    allow_rechunk=False,
     **kwargs,
 ):
     """
@@ -26,7 +22,7 @@ def apply_gufunc(
     `equivalent function <https://docs.dask.org/en/stable/generated/dask.array.gufunc.apply_gufunc.html>`_
     in Dask. Refer there for usage information.
 
-    Current limitations: ``keepdims=True``, and ``allow_rechunk=True`` are not supported;
+    Current limitations: ``keepdims``, and ``allow_rechunk`` are not supported;
     and multiple outputs are not supported.
 
     Cubed assumes that ``func`` will allocate a new output array. However, if it allocates more memory
@@ -34,11 +30,9 @@ def apply_gufunc(
     to the amount needed in bytes (per task).
     """
 
-    if keepdims:
-        raise NotImplementedError("keepdims is not supported in apply_gufunc")
-
-    # Don't fail immediately if allow_rechunk=True, since rechunking may not be necessary.
-    # However, if rechunking is necessary, the code below with raise an exception.
+    # Currently the following parameters cannot be changed
+    # keepdims = False
+    allow_rechunk = False
 
     # based on dask's apply_gufunc
 
@@ -54,15 +48,8 @@ def apply_gufunc(
 
     if nout is not None:
         raise NotImplementedError(
-            "Multiple outputs are not yet supported, see https://github.com/cubed-dev/cubed/issues/69"
+            "Multiple outputs are not yet supported, see https://github.com/tomwhite/cubed/issues/69"
         )
-
-    if (
-        nout is None
-        and isinstance(output_dtypes, (tuple, list))
-        and len(output_dtypes) == 1
-    ):
-        output_dtypes = output_dtypes[0]
 
     # Vectorize function, if required
     if vectorize:
@@ -81,13 +68,7 @@ def apply_gufunc(
     # Main code:
 
     # Cast all input arrays to cubed
-    # Use a spec if there is one. Note that all args have to have the same spec, and
-    # this will be checked later when constructing the plan (see check_array_specs).
-    from cubed.array_api.creation_functions import asarray
-
-    specs = [a.spec for a in args if hasattr(a, "spec")]
-    spec = specs[0] if len(specs) > 0 else None
-    args = [asarray(a, spec=spec) for a in args]
+    # args = [asarray(a) for a in args]  # TODO: do we need to support casting?
 
     if len(input_coredimss) != len(args):
         raise ValueError(
@@ -134,26 +115,28 @@ def apply_gufunc(
         # Check that the arrays have same length for same dimensions or dimension `1`
         if set(sizes) | {1} != {1, max(sizes)}:
             raise ValueError(f"Dimension `'{dim}'` with different lengths in arrays")
-
-        # Check that chunking is correct, but don't rechunk
-        # TODO(#833): rechunk if allow_rechunk=True
-        chunksizes = chunksizess[dim]
-        # Check if core dimensions consist of only one chunk
-        if (dim in core_shapes) and (chunksizes[0][0] < core_shapes[dim]):
-            raise ValueError(
-                f"Core dimension `'{dim}'` consists of multiple chunks. To fix, rechunk into a single \
-chunk along this dimension, but beware that this may increase memory usage \
-significantly."
+        if not allow_rechunk:
+            chunksizes = chunksizess[dim]
+            # Check if core dimensions consist of only one chunk
+            if (dim in core_shapes) and (chunksizes[0][0] < core_shapes[dim]):
+                raise ValueError(
+                    "Core dimension `'{}'` consists of multiple chunks. To fix, rechunk into a single \
+chunk along this dimension or set `allow_rechunk=True`, but beware that this may increase memory usage \
+significantly.".format(
+                        dim
+                    )
+                )
+            # Check if loop dimensions consist of same chunksizes, when they have sizes > 1
+            relevant_chunksizes = list(
+                unique(c for s, c in zip(sizes, chunksizes) if s > 1)
             )
-        # Check if loop dimensions consist of same chunksizes, when they have sizes > 1
-        relevant_chunksizes = list(
-            unique(c for s, c in zip(sizes, chunksizes) if s > 1)
-        )
-        if len(relevant_chunksizes) > 1:
-            raise ValueError(f"Dimension `'{dim}'` with different chunksize present")
+            if len(relevant_chunksizes) > 1:
+                raise ValueError(
+                    f"Dimension `'{dim}'` with different chunksize present"
+                )
 
     # Apply function - use blockwise here
-    arginds = list(chain.from_iterable(zip(args, input_dimss)))
+    arginds = list(concat(zip(args, input_dimss)))
 
     from cubed.core.ops import blockwise
 

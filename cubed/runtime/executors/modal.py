@@ -1,98 +1,58 @@
-import asyncio
-import contextlib
 import os
+import time
 from asyncio.exceptions import TimeoutError
-from collections.abc import Callable, Sequence
-from typing import Any
+from typing import Optional, Sequence
 
 import modal
 from modal.exception import ConnectionError
 from networkx import MultiDiGraph
 from tenacity import retry, retry_if_exception_type, stop_after_attempt
 
-from cubed import config
-from cubed.runtime.asyncio import async_map_dag
-from cubed.runtime.backup import use_backups_default
-from cubed.runtime.types import Callback, DagExecutor
-from cubed.runtime.utils import asyncio_run, execute_with_stats
-from cubed.spec import Spec, spec_from_config
-from cubed.utils import convert_to_bytes
+from cubed.core.array import Callback, Spec
+from cubed.core.plan import visit_nodes
+from cubed.runtime.types import DagExecutor
+from cubed.runtime.utils import execute_with_stats, handle_callbacks
 
-app = modal.App("cubed-app", include_source=True)
+RUNTIME_MEMORY_MIB = 2000
 
-# Get Modal App settings from Cubed configuration. Note that we have to do this
-# globally, since Modal remote functions have to be defined globally.
-if modal.is_local():
-    spec = spec_from_config(config)
-    executor_options = spec.executor_options
-else:
-    executor_options = {}
+stub = modal.Stub("cubed-stub")
 
-runtime_memory = convert_to_bytes(executor_options.get("memory", "2GB"))
-runtime_memory_mib = runtime_memory // 1_000_000
-retries = executor_options.get("retries", 2)
-timeout = executor_options.get("timeout", 180)
-cloud = executor_options.get("cloud", "aws")
-region = executor_options.get("region", None)
-if modal.is_local() and region is None:
-    raise ValueError(
-        "Must set region when running using Modal, via the Cubed 'spec.executor_options.region' configuration setting."
-    )
-
-requirements_file = executor_options.get("requirements_file", None)
+requirements_file = os.getenv("CUBED_MODAL_REQUIREMENTS_FILE")
 
 if requirements_file:
     image = modal.Image.debian_slim().pip_install_from_requirements(requirements_file)
+    aws_image = image
+    gcp_image = image
 else:
-    if cloud == "aws":
-        image = modal.Image.debian_slim().pip_install(
-            [
-                "array-api-compat",
-                "donfig",
-                "mypy_extensions",  # for rechunker
-                "ndindex",
-                "networkx",
-                "obstore",
-                "psutil",
-                "pytest-mock",  # TODO: only needed for tests
-                "tenacity",
-                "toolz",
-                "zarr",
-            ]
-        )
-    elif cloud == "gcp":
-        image = modal.Image.debian_slim().pip_install(
-            [
-                "array-api-compat",
-                "donfig",
-                "fsspec",
-                "mypy_extensions",  # for rechunker
-                "ndindex",
-                "networkx",
-                "psutil",
-                "pytest-mock",  # TODO: only needed for tests
-                "gcsfs",
-                "tenacity",
-                "toolz",
-                "zarr",
-            ]
-        )
-    else:
-        raise ValueError(f"Unrecognized cloud: {cloud}")
-
-secret_name = executor_options.get("secret", None)
-if secret_name is None:
-    if cloud == "aws":
-        secret_name = "my-aws-secret"
-    elif secret_name == "gcp":
-        secrets_name = "my-googlecloud-secret"
-    else:
-        raise ValueError(f"Unrecognized cloud: {cloud}")
-secrets = [modal.Secret.from_name(secret_name)]
+    aws_image = modal.Image.debian_slim().pip_install(
+        [
+            "fsspec",
+            "mypy_extensions",  # for rechunker
+            "networkx",
+            "pytest-mock",  # TODO: only needed for tests
+            "s3fs",
+            "tenacity",
+            "toolz",
+            "zarr",
+        ]
+    )
+    gcp_image = modal.Image.debian_slim().pip_install(
+        [
+            "fsspec",
+            "mypy_extensions",  # for rechunker
+            "networkx",
+            "pytest-mock",  # TODO: only needed for tests
+            "gcsfs",
+            "tenacity",
+            "toolz",
+            "zarr",
+        ]
+    )
 
 
 def check_runtime_memory(spec):
     allowed_mem = spec.allowed_mem if spec is not None else None
+    runtime_memory = RUNTIME_MEMORY_MIB * 1024 * 1024
     if allowed_mem is not None:
         if runtime_memory < allowed_mem:
             raise ValueError(
@@ -100,116 +60,103 @@ def check_runtime_memory(spec):
             )
 
 
-# We use a class so for GCP we can set up credentials by hooking into the container lifecycle
-@app.cls(
-    image=image,
-    secrets=secrets,
-    cpu=1.0,
-    memory=runtime_memory_mib,  # modal memory is in MiB
-    retries=retries,
-    timeout=timeout,
-    cloud=cloud,
-    region=region,
+@stub.function(
+    image=aws_image,
+    secret=modal.Secret.from_name("my-aws-secret"),
+    memory=RUNTIME_MEMORY_MIB,
+    retries=2,
+    cloud="aws",
+)
+def run_remotely(input, func=None, config=None):
+    print(f"running remotely on {input}")
+    # note we can't use the execution_stat decorator since it doesn't work with modal decorators
+    result, stats = execute_with_stats(func, input, config=config)
+    return result, stats
+
+
+# For GCP we need to use a class so we can set up credentials by hooking into the container lifecycle
+@stub.cls(
+    image=gcp_image,
+    secret=modal.Secret.from_name("my-googlecloud-secret"),
+    memory=RUNTIME_MEMORY_MIB,
+    retries=2,
+    cloud="gcp",
 )
 class Container:
-    @modal.enter()
-    def set_up_credentials(self):
-        if os.getenv("MODAL_CLOUD_PROVIDER") == "CLOUD_PROVIDER_GCP":
-            json = os.environ["SERVICE_ACCOUNT_JSON"]
-            path = os.path.abspath("application_credentials.json")
-            with open(path, "w") as f:
-                f.write(json)
-            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = path
+    def __enter__(self):
+        json = os.environ["SERVICE_ACCOUNT_JSON"]
+        path = os.path.abspath("application_credentials.json")
+        with open(path, "w") as f:
+            f.write(json)
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = path
 
     @modal.method()
-    def run_remotely(self, input, func=None, config=None, name=None, compute_id=None):
-        print(f"running remotely on {input} in {os.getenv('MODAL_REGION')}")
+    def run_remotely(self, input, func=None, config=None):
+        print(f"running remotely on {input}")
         # note we can't use the execution_stat decorator since it doesn't work with modal decorators
         result, stats = execute_with_stats(func, input, config=config)
         return result, stats
 
 
-def modal_create_futures_func(function: Callable[..., Any]):
-    def create_futures_func(input, **kwargs):
-        return [
-            (i, asyncio.ensure_future(function.remote.aio(i, **kwargs))) for i in input
-        ]
+# This just retries the initial connection attempt, not the function calls
+@retry(
+    reraise=True,
+    retry=retry_if_exception_type((TimeoutError, ConnectionError)),
+    stop=stop_after_attempt(3),
+)
+def execute_dag(
+    dag: MultiDiGraph,
+    callbacks: Optional[Sequence[Callback]] = None,
+    array_names: Optional[Sequence[str]] = None,
+    resume: Optional[bool] = None,
+    spec: Optional[Spec] = None,
+    cloud: Optional[str] = None,
+    **kwargs,
+) -> None:
+    if spec is not None:
+        check_runtime_memory(spec)
+    with stub.run():
+        cloud = cloud or "aws"
+        if cloud == "aws":
+            app_function = run_remotely
+        elif cloud == "gcp":
+            app_function = Container().run_remotely
+        else:
+            raise ValueError(f"Unrecognized cloud: {cloud}")
+        for name, node in visit_nodes(dag, resume=resume):
+            pipeline = node["pipeline"]
+            task_create_tstamp = time.time()
+            for _, stats in app_function.map(
+                pipeline.mappable,
+                order_outputs=False,
+                kwargs=dict(func=pipeline.function, config=pipeline.config),
+            ):
+                stats["array_name"] = name
+                stats["task_create_tstamp"] = task_create_tstamp
+                handle_callbacks(callbacks, stats)
 
-    return create_futures_func
 
+class ModalDagExecutor(DagExecutor):
+    """An execution engine that uses Modal."""
 
-class ModalExecutor(DagExecutor):
-    """An execution engine that uses Modal's async API."""
-
-    def __init__(self, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
-
-    @property
-    def name(self) -> str:
-        return "modal"
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
 
     def execute_dag(
         self,
         dag: MultiDiGraph,
-        callbacks: Sequence[Callback] | None = None,
-        spec: Spec | None = None,
-        compute_id: str | None = None,
+        callbacks: Optional[Sequence[Callback]] = None,
+        array_names: Optional[Sequence[str]] = None,
+        resume: Optional[bool] = None,
+        spec: Optional[Spec] = None,
         **kwargs,
     ) -> None:
         merged_kwargs = {**self.kwargs, **kwargs}
-        # remove executor options as they should already have been used in defining the remote functions
-        for executor_option in (
-            "memory",
-            "retries",
-            "timeout",
-            "cloud",
-            "region",
-            "requirements_file",
-            "secret",
-        ):
-            merged_kwargs.pop(executor_option, None)
-        asyncio_run(
-            self._async_execute_dag(
-                dag,
-                callbacks=callbacks,
-                spec=spec,
-                compute_id=compute_id,
-                **merged_kwargs,
-            )
+        execute_dag(
+            dag,
+            callbacks=callbacks,
+            array_names=array_names,
+            resume=resume,
+            spec=spec,
+            **merged_kwargs,
         )
-
-    # This just retries the initial connection attempt, not the function calls
-    @retry(
-        reraise=True,
-        retry=retry_if_exception_type((TimeoutError, ConnectionError)),
-        stop=stop_after_attempt(3),
-    )
-    async def _async_execute_dag(
-        self,
-        dag: MultiDiGraph,
-        callbacks: Sequence[Callback] | None = None,
-        spec: Spec | None = None,
-        cloud: str | None = None,
-        compute_arrays_in_parallel: bool | None = None,
-        **kwargs,
-    ) -> None:
-        if spec is not None:
-            check_runtime_memory(spec)
-            if "use_backups" not in kwargs and use_backups_default(spec):
-                kwargs["use_backups"] = True
-
-        function = Container().run_remotely
-
-        enable_output = kwargs.pop("enable_output", False)
-        cm = modal.enable_output() if enable_output else contextlib.nullcontext()
-
-        with cm:
-            async with app.run():
-                create_futures_func = modal_create_futures_func(function)
-                await async_map_dag(
-                    create_futures_func,
-                    dag=dag,
-                    callbacks=callbacks,
-                    compute_arrays_in_parallel=compute_arrays_in_parallel,
-                    **kwargs,
-                )

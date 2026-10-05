@@ -1,7 +1,0 @@
-spec:
-  work_dir: "gs://cubed-$USER-temp"
-  allowed_mem: "2GB"
-  executor_name: "modal"
-  executor_options:
-    cloud: "gcp"
-    region: "europe-west2"  # change to match the work_dir bucket

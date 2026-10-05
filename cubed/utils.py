@@ -1,68 +1,32 @@
 import collections
-import inspect
 import itertools
 import platform
 import sys
 import sysconfig
 import traceback
-from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from functools import partial, reduce
-from itertools import accumulate
 from math import prod
-from operator import add, mul
+from operator import add
 from pathlib import Path
 from posixpath import join
-from types import FrameType
-from typing import Any, Union, cast
+from typing import Tuple, Union
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 import numpy as np
+import tlz as toolz
 
-from cubed.backend_array_api import backend_dtype_to_numpy_dtype
-from cubed.backend_array_api import namespace as nxp
-from cubed.types import (
-    T_Chunks,
-    T_DType,
-    T_RectangularChunks,
-    T_RegularChunks,
-    T_Shape,
-    T_StandardArray,
-)
+from cubed.types import T_DType, T_RectangularChunks, T_RegularChunks
 from cubed.vendor.dask.array.core import _check_regular_chunks
-from cubed.vendor.dask.array.core import normalize_chunks as dask_normalize_chunks
 
 PathType = Union[str, Path]
 
 
-def array_memory(dtype: T_DType, shape: T_Shape) -> int:
-    """Calculate the amount of memory in bytes that an array uses."""
-    return itemsize(normalize_dtype(dtype)) * prod(shape)
-
-
-def chunk_memory(arr) -> int:
+def chunk_memory(dtype: T_DType, chunksize: T_RegularChunks) -> int:
     """Calculate the amount of memory in bytes that a single chunk uses."""
-    if hasattr(arr, "chunkmem"):
-        return arr.chunkmem
-    return array_memory(arr.dtype, largest_chunk(arr.chunks))
+    return np.dtype(dtype).itemsize * prod(chunksize)
 
 
-def array_size(shape: T_Shape) -> int:
-    """Number of elements in an array."""
-    return reduce(mul, shape, 1)
-
-
-def offset_to_block_id(offset: int, numblocks: tuple[int, ...]) -> tuple[int, ...]:
-    """Convert an index offset to a block ID (chunk coordinates)."""
-    return tuple(int(i) for i in np.unravel_index(offset, numblocks))
-
-
-def block_id_to_offset(block_id: tuple[int, ...], numblocks: tuple[int, ...]) -> int:
-    """Convert a block ID (chunk coordinates) to an index offset."""
-    return int(np.ravel_multi_index(block_id, numblocks))
-
-
-def get_item(chunks: T_RectangularChunks, idx: tuple[int, ...]) -> tuple[slice, ...]:
+def get_item(chunks: T_RectangularChunks, idx: Tuple[int, ...]) -> Tuple[slice, ...]:
     """Convert a chunk index to a tuple of slices."""
     # could use Dask's cached_cumsum here if it improves performance
     starts = tuple(_cumsum(c, initial_zero=True) for c in chunks)
@@ -72,9 +36,9 @@ def get_item(chunks: T_RectangularChunks, idx: tuple[int, ...]) -> tuple[slice, 
 
 def _cumsum(seq, initial_zero=False):
     if initial_zero:
-        return tuple(accumulate(seq, add, initial=0))
+        return tuple(toolz.accumulate(add, seq, 0))
     else:
-        return tuple(accumulate(seq, add))
+        return tuple(toolz.accumulate(add, seq))
 
 
 def join_path(dir_url: PathType, child_path: str) -> str:
@@ -83,16 +47,6 @@ def join_path(dir_url: PathType, child_path: str) -> str:
     new_path = quote(join(unquote(parts.path), child_path))
     split_parts = (parts.scheme, parts.netloc, new_path, parts.query, parts.fragment)
     return urlunsplit(split_parts)
-
-
-def is_local_path(path: PathType):
-    """Determine if a path string is for the local filesystem."""
-    return urlsplit(str(path)).scheme in ("", "file")
-
-
-def is_cloud_storage_path(path: PathType):
-    """Determine if a path string is for cloud storage."""
-    return urlsplit(str(path)).scheme in ("gs", "s3")
 
 
 def memory_repr(num: int) -> str:
@@ -119,11 +73,6 @@ def memory_repr(num: int) -> str:
         val /= 1000.0
     # fall back to scientific notation
     return f"{num:.1e} bytes"
-
-
-def format_int(n: int) -> str:
-    """Format an integer as text using a thousands separator."""
-    return f"{n:,}"
 
 
 def peak_measured_mem() -> int:
@@ -159,18 +108,7 @@ def to_chunksize(chunkset: T_RectangularChunks) -> T_RegularChunks:
     if not _check_regular_chunks(chunkset):
         raise ValueError(f"Array must have regular chunks, but found chunks={chunkset}")
 
-    return tuple(max(c[0], 1) for c in chunkset)
-
-
-def numblocks(chunks: T_RectangularChunks) -> tuple[int, ...]:
-    return tuple(map(len, chunks))
-
-
-def largest_chunk(chunks: T_RegularChunks | T_RectangularChunks) -> T_RegularChunks:
-    if (len(chunks) == 0) or isinstance(chunks[0], int):
-        return chunks  # type: ignore[return-value]
-    else:
-        return tuple(max(c, default=1) for c in chunks)  # type: ignore[arg-type]
+    return tuple(c[0] for c in chunkset)
 
 
 @dataclass
@@ -183,24 +121,22 @@ class StackSummary:
     module: str
     array_names_to_variable_names: dict
 
-    def is_cubed(self) -> bool:
+    def is_cubed(self):
         """Return True if this stack frame is a Cubed call."""
-        return (
-            self.module.startswith("cubed.") or self.module.startswith("cubed_xarray.")
-        ) and not self.module.startswith("cubed.tests.")
+        return self.module.startswith("cubed.") and not self.module.startswith(
+            "cubed.tests."
+        )
 
-    def is_on_python_lib_path(self) -> bool:
+    def is_on_python_lib_path(self):
         """Return True if this stack frame is from a library on Python's library path."""
         python_lib_path = sysconfig.get_path("purelib")
 
         return self.filename.startswith(python_lib_path)
 
 
-def extract_stack_summaries(
-    frame: FrameType | None, limit: int | None = None
-) -> list[StackSummary]:
+def extract_stack_summaries(frame, limit=None):
     """Like Python's ``StackSummary.extract``, but returns module information."""
-    frame_gen: Iterable[tuple[FrameType, int]] = traceback.walk_stack(frame)
+    frame_gen = traceback.walk_stack(frame)
 
     # from StackSummary.extract
     if limit is None:
@@ -230,51 +166,26 @@ def extract_stack_summaries(
     return stack_summaries
 
 
-def extract_array_names(frame: FrameType) -> dict[str, str]:
+def extract_array_names(frame):
     """Look for Cubed arrays in local variables to create a mapping from (internally generated) array names to variable names."""
 
     from cubed import Array
 
-    array_names_to_variable_names: dict[str, str] = {}
-    for name, obj in frame.f_locals.items():
-        if name.startswith("_"):
-            # ignore previous output variables like _, __, and _1 (IPython)
-            continue
-        if isinstance(obj, Array):
-            array_names_to_variable_names[obj.name] = name
+    array_names_to_variable_names = {}
+    for var, arr in frame.f_locals.items():
+        if isinstance(arr, Array):
+            array_names_to_variable_names[arr.name] = var
         elif (
-            type(obj).__module__.split(".")[0] == "xarray"
-            and obj.__class__.__name__ == "DataArray"
+            type(arr).__module__.split(".")[0] == "xarray"
+            and hasattr(arr, "data")
+            and hasattr(arr, "name")
         ):
-            # Note: We use ._data here instead of .data to avoid eager loading inside xarray.open_dataset internals - see https://github.com/cubed-dev/cubed/issues/855
-            if isinstance(obj.variable._data, Array):
-                array_names_to_variable_names[obj.variable._data.name] = name
-        elif (
-            type(obj).__module__.split(".")[0] == "xarray"
-            and obj.__class__.__name__ == "Dataset"
-        ):
-            for var_name, var in obj.variables.items():
-                if isinstance(var._data, Array):
-                    array_names_to_variable_names[var._data.name] = f"{name}.{var_name}"
+            if isinstance(arr.data, Array):
+                array_names_to_variable_names[arr.data.name] = arr.name
     return array_names_to_variable_names
 
 
-def extract_array_names_from_stack_summaries(
-    stacks: list[list[StackSummary]],
-) -> dict[str, str]:
-    array_display_names: dict[str, str] = {}
-    for stack_summaries in stacks:
-        # Look for array names outside cubed, prioritizing those near top of stack.
-        # E.g. if user code defines a variable v1 referring to an array, and passes
-        # it to a utility function that assigns the array locally to v2 then v1 takes
-        # priority.
-        first_cubed_i = min(i for i, s in enumerate(stack_summaries) if s.is_cubed())
-        for caller_summary in reversed(stack_summaries[:first_cubed_i]):
-            array_display_names.update(caller_summary.array_names_to_variable_names)
-    return array_display_names
-
-
-def convert_to_bytes(size: int | float | str) -> int:
+def convert_to_bytes(size: Union[int, str]) -> int:
     """
     Converts the input data size to bytes.
 
@@ -282,123 +193,33 @@ def convert_to_bytes(size: int | float | str) -> int:
 
     Parameters
     ----------
-    size: int, float, or str:
-        Size of data. If numeric it should represent an integer >=0. If str it should be of form <value><unit> where unit can be B, kB, MB, GB, TB etc.
+    size: in or str:
+        Size of data. If int it should be >=0. If str it should be of form <value><unit> where unit can be kB, MB, GB, TB etc.
 
     Returns
     -------
     int: The size in bytes
     """
-    units: dict[str, int] = {"kB": 1, "MB": 2, "GB": 3, "TB": 4, "PB": 5}
+    units = {"B": 0, "kB": 1, "MB": 2, "GB": 3, "TB": 4, "PB": 5}
 
-    def is_numeric_str(s: str) -> bool:
-        try:
-            float(s)
-            return True
-        except ValueError:
-            return False
-
-    if isinstance(size, str):
-        size = size.replace(" ", "")
-
-        # check if the format of the string is valid
-        if is_numeric_str(size):
-            unit_factor = 1.0
-            value = size
-        elif size[-1] == "B" and is_numeric_str(size[:-1]):
-            unit_factor = 1.0
+    if isinstance(size, int) and size >= 0:
+        return size
+    elif isinstance(size, str):
+        # check if the format is valid
+        if size[-1] == "B" and size[:-1].isdigit():
+            unit = "B"
             value = size[:-1]
-        elif size[-2:] in units and is_numeric_str(size[:-2]):
+        elif size[-2:] in units and size[:-2].isdigit():
             unit = size[-2:]
-            unit_factor = 1000 ** units[unit]
             value = size[:-2]
         else:
             raise ValueError(
-                f"Invalid value: {size}. Expected the string to be a numeric value ending with an SI prefix."
+                f"Invalid value: {size}. Expected a string ending with an SI prefix."
             )
 
-        # convert to float number of bytes
-        size = float(value) * unit_factor
-
-    if isinstance(size, float):
-        if size.is_integer():
-            size = int(size)
-        else:
-            raise ValueError(
-                f"Invalid value: {size}. Can't have a non-integer number of bytes"
-            )
-
-    if size >= 0:
-        return size
-    else:
-        raise ValueError(f"Invalid value: {size}. Must be a positive value")
-
-
-def _broadcast_trick_inner(
-    func: Callable[..., T_StandardArray], shape: T_Shape, *args: Any, **kwargs: Any
-) -> T_StandardArray:
-    # cupy-specific hack. numpy is happy with hardcoded shape=().
-    null_shape = () if shape == () else 1
-
-    return nxp.broadcast_to(func(*args, shape=null_shape, **kwargs), shape)
-
-
-def broadcast_trick(
-    func: Callable[..., T_StandardArray],
-) -> Callable[..., T_StandardArray]:
-    """Apply Dask's broadcast trick to array API functions that produce arrays
-    containing a single value to save space in memory.
-
-    Note that this should only be used for arrays that never mutated.
-    """
-    inner = partial(_broadcast_trick_inner, func)
-    inner.__doc__ = func.__doc__
-    inner.__name__ = func.__name__  # type: ignore[attr-defined]
-    return inner
-
-
-def normalize_shape(shape: int | tuple[int, ...] | None) -> T_Shape:
-    """Normalize a `shape` argument to a tuple of ints."""
-
-    if shape is None:
-        raise TypeError("shape is None")
-
-    if isinstance(shape, int):
-        shape = (shape,)
-
-    shape = cast(tuple[int, ...], shape)
-    shape = tuple(int(s) for s in shape)
-    return shape
-
-
-def normalize_dtype(dtype, device=None) -> T_DType:
-    """Normalize a `dtype` argument to the underlying backend array API dtype.
-
-    This allows dtypes to be specified as `bool`, `int`, `float`, or `complex`,
-    or a string (if the array API implementation supports it).
-    """
-
-    return np.dtype(dtype)
-
-
-def itemsize(dtype: T_DType) -> int:
-    """Return the length of one array element in bytes."""
-    if hasattr(dtype, "itemsize") and not inspect.isdatadescriptor(dtype.itemsize):
-        return dtype.itemsize
-    elif isinstance(dtype, list):
-        return sum(itemsize(v) for _, v in dtype)
-    else:
-        # if dtype has no itemsize property, convert to numpy and use its itemsize
-        return backend_dtype_to_numpy_dtype(dtype).itemsize
-
-
-def normalize_chunks(
-    chunks: T_Chunks,
-    shape: T_Shape | None = None,
-    limit: int | None = None,
-    dtype: T_DType | None = None,
-    previous_chunks: T_RectangularChunks | None = None,
-) -> T_RectangularChunks:
-    return dask_normalize_chunks(
-        chunks, shape=shape, limit=limit, dtype=dtype, previous_chunks=previous_chunks
+        if unit in units and value.isdigit():
+            # convert to bytes
+            return int(value) * (1000 ** units[unit])
+    raise ValueError(
+        f"Invalid value: {size}. Expected a positive integer or a string ending with an SI prefix."
     )

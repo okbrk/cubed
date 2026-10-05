@@ -1,63 +1,42 @@
-import os
 import platform
-import re
 
+import fsspec
 import numpy as np
-import psutil
 import pytest
+from numpy.testing import assert_array_equal
 
 import cubed
 import cubed.array_api as xp
 import cubed.random
-from cubed._testing import assert_array_equal
-from cubed.diagnostics import ProgressBar
-from cubed.diagnostics.history import HistoryCallback
-from cubed.diagnostics.mem_usage import MemoryVisualizationCallback
-from cubed.diagnostics.mem_warn import MemoryWarningCallback
-from cubed.diagnostics.rich import RichProgressBar
-from cubed.diagnostics.timeline import TimelineVisualizationCallback
-from cubed.diagnostics.tqdm import TqdmProgressBar
-from cubed.diagnostics.widgets import LivePlanViewer, LiveTimelineViewer
-from cubed.diagnostics.widgets.memory import LiveMemoryViewer
+from cubed.extensions.history import HistoryCallback
+from cubed.extensions.timeline import TimelineVisualizationCallback
+from cubed.extensions.tqdm import TqdmProgressBar
 from cubed.primitive.blockwise import apply_blockwise
-from cubed.runtime.create import create_executor
+from cubed.runtime.executors.python_async import AsyncPythonDagExecutor
 from cubed.tests.utils import (
     ALL_EXECUTORS,
     MAIN_EXECUTORS,
     MODAL_EXECUTORS,
-    CallbackCounter,
     TaskCounter,
 )
 
 
-@pytest.fixture
+@pytest.fixture()
 def spec(tmp_path):
     return cubed.Spec(tmp_path, allowed_mem=100000)
 
 
-@pytest.fixture(
-    scope="module",
-    params=MAIN_EXECUTORS,
-    ids=[executor.name for executor in MAIN_EXECUTORS],
-)
+@pytest.fixture(scope="module", params=MAIN_EXECUTORS)
 def executor(request):
     return request.param
 
 
-@pytest.fixture(
-    scope="module",
-    params=ALL_EXECUTORS,
-    ids=[executor.name for executor in ALL_EXECUTORS],
-)
+@pytest.fixture(scope="module", params=ALL_EXECUTORS)
 def any_executor(request):
     return request.param
 
 
-@pytest.fixture(
-    scope="module",
-    params=MODAL_EXECUTORS,
-    ids=[executor.name for executor in MODAL_EXECUTORS],
-)
+@pytest.fixture(scope="module", params=MODAL_EXECUTORS)
 def modal_executor(request):
     return request.param
 
@@ -70,24 +49,8 @@ def mock_apply_blockwise(*args, **kwargs):
     global mock_call_counter
     mock_call_counter += 1
     if mock_call_counter % 3 == 0:
-        raise OSError("Test fault injection")
+        raise IOError("Test fault injection")
     return apply_blockwise(*args, **kwargs)
-
-
-def test_equality():
-    executor = create_executor("threads")
-    assert executor == create_executor("threads")
-
-    executor_2_max_workers = create_executor(
-        "threads", executor_options=dict(max_workers=2)
-    )
-    assert executor_2_max_workers == create_executor(
-        "threads", executor_options=dict(max_workers=2)
-    )
-    assert executor_2_max_workers != create_executor("threads")
-    assert executor_2_max_workers != create_executor(
-        "threads", executor_options=dict(max_workers=1)
-    )
 
 
 # see tests/runtime for more tests for retries for other executors
@@ -95,8 +58,8 @@ def test_equality():
     platform.system() == "Windows", reason="measuring memory does not run on windows"
 )
 def test_retries(mocker, spec):
-    # Use threads executor since single-threaded executor doesn't support retries
-    executor = create_executor("threads")
+    # Use AsyncPythonDagExecutor since PythonDagExecutor doesn't support retries
+    executor = AsyncPythonDagExecutor()
     # Inject faults into the primitive layer
     mocker.patch(
         "cubed.primitive.blockwise.apply_blockwise", side_effect=mock_apply_blockwise
@@ -110,172 +73,111 @@ def test_retries(mocker, spec):
     )
 
 
-@pytest.mark.parametrize("optimize_graph", [True, False])
-@pytest.mark.parametrize("compute_arrays_in_parallel", [True, False])
-def test_callback_counts(spec, executor, optimize_graph, compute_arrays_in_parallel):
-    callback_counter = CallbackCounter()
-
-    a = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], chunks=(2, 2), spec=spec)
-    b = xp.asarray([[1, 1, 1], [1, 1, 1], [1, 1, 1]], chunks=(2, 2), spec=spec)
-    c = xp.add(a, b)
-    d = xp.negative(c)
-
-    d.compute(
-        executor=executor,
-        callbacks=[callback_counter],
-        optimize_graph=optimize_graph,
-        compute_arrays_in_parallel=compute_arrays_in_parallel,
-    )
-
-    num_created_arrays = 1 if optimize_graph else 2
-    assert callback_counter.compute_start.total() == 1
-    assert callback_counter.compute_end.total() == 1
-    assert callback_counter.operation_start.total() == num_created_arrays + 1
-    assert callback_counter.operation_end.total() == num_created_arrays + 1
-    assert (
-        callback_counter.task_end.total() == num_created_arrays * 4 + num_created_arrays
-    )
-
-
 @pytest.mark.skipif(
     platform.system() == "Windows", reason="measuring memory does not run on windows"
 )
 def test_callbacks(spec, executor):
+    try:
+        from cubed.runtime.executors.dask import DaskDelayedExecutor
+
+        if isinstance(executor, DaskDelayedExecutor):
+            pytest.skip(f"{type(executor)} does not support callbacks")
+    except ImportError:
+        pass
+
     task_counter = TaskCounter()
     # test following indirectly by checking they don't cause a failure
     progress = TqdmProgressBar()
     hist = HistoryCallback()
     timeline_viz = TimelineVisualizationCallback()
-    memory_viz = MemoryVisualizationCallback()
 
     a = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], chunks=(2, 2), spec=spec)
     b = xp.asarray([[1, 1, 1], [1, 1, 1], [1, 1, 1]], chunks=(2, 2), spec=spec)
     c = xp.add(a, b)
     assert_array_equal(
         c.compute(
-            executor=executor,
-            callbacks=[task_counter, progress, hist, timeline_viz, memory_viz],
+            executor=executor, callbacks=[task_counter, progress, hist, timeline_viz]
         ),
         np.array([[2, 3, 4], [5, 6, 7], [8, 9, 10]]),
     )
 
-    num_created_arrays = 1
+    num_created_arrays = 3
     assert task_counter.value == num_created_arrays + 4
-
-
-def test_widget_callbacks(executor):
-    if executor.name != "processes":
-        pytest.skip(f"{executor.name} executor does not support LiveMemoryViewer")
-    # test following indirectly by checking they don't cause a failure
-    # note that the javascript part is *not* tested
-    with LivePlanViewer(), LiveMemoryViewer(), LiveTimelineViewer():
-        a = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], chunks=(2, 2))
-        b = xp.asarray([[1, 1, 1], [1, 1, 1], [1, 1, 1]], chunks=(2, 2))
-        c = xp.add(a, b)
-        assert_array_equal(
-            c.compute(executor=executor), np.array([[2, 3, 4], [5, 6, 7], [8, 9, 10]])
-        )
-
-
-def test_callbacks_as_context_managers(spec, executor):
-    with TaskCounter() as task_counter, ProgressBar():
-        assert task_counter is not None
-        a = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], chunks=(2, 2), spec=spec)
-        b = xp.asarray([[1, 1, 1], [1, 1, 1], [1, 1, 1]], chunks=(2, 2), spec=spec)
-        c = xp.add(a, b)
-        assert_array_equal(
-            c.compute(executor=executor),
-            np.array([[2, 3, 4], [5, 6, 7], [8, 9, 10]]),
-        )
-
-        num_created_arrays = 1
-        assert task_counter.value == num_created_arrays + 4
-
-
-def test_rich_progress_bar(spec, executor):
-    # test indirectly by checking it doesn't cause a failure
-    progress = RichProgressBar()
-
-    a = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], chunks=(2, 2), spec=spec)
-    b = xp.asarray([[1, 1, 1], [1, 1, 1], [1, 1, 1]], chunks=(2, 2), spec=spec)
-    c = xp.add(a, b)
-    assert_array_equal(
-        c.compute(executor=executor, callbacks=[progress]),
-        np.array([[2, 3, 4], [5, 6, 7], [8, 9, 10]]),
-    )
 
 
 @pytest.mark.cloud
 def test_callbacks_modal(spec, modal_executor):
     task_counter = TaskCounter(check_timestamps=False)
     tmp_path = "s3://cubed-unittest/callbacks"
-    spec = cubed.Spec(
-        tmp_path, allowed_mem=100000, storage_options=dict(use_obstore=True)
-    )
+    spec = cubed.Spec(tmp_path, allowed_mem=100000)
+    try:
+        a = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], chunks=(2, 2), spec=spec)
+        b = xp.asarray([[1, 1, 1], [1, 1, 1], [1, 1, 1]], chunks=(2, 2), spec=spec)
+        c = xp.add(a, b)
+        assert_array_equal(
+            c.compute(executor=modal_executor, callbacks=[task_counter]),
+            np.array([[2, 3, 4], [5, 6, 7], [8, 9, 10]]),
+        )
 
-    a = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], chunks=(2, 2), spec=spec)
-    b = xp.asarray([[1, 1, 1], [1, 1, 1], [1, 1, 1]], chunks=(2, 2), spec=spec)
-    c = xp.add(a, b)
-    assert_array_equal(
-        c.compute(executor=modal_executor, callbacks=[task_counter]),
-        np.array([[2, 3, 4], [5, 6, 7], [8, 9, 10]]),
-    )
-
-    num_created_arrays = 1
-    assert task_counter.value == num_created_arrays + 4
-
-
-@pytest.mark.skipif(
-    platform.system() == "Windows", reason="measuring memory does not run on windows"
-)
-def test_mem_warn(tmp_path, executor):
-    if executor.name not in ("processes", "lithops"):
-        pytest.skip(f"{executor.name} executor does not support MemoryWarningCallback")
-
-    spec = cubed.Spec(tmp_path, allowed_mem=200_000_000, reserved_mem=100_000_000)
-    mem_warn = MemoryWarningCallback()
-
-    def func(a):
-        np.ones(100_000_000)  # blow memory
-        return a
-
-    a = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], chunks=(2, 2), spec=spec)
-    b = cubed.map_blocks(func, a, dtype=a.dtype)
-    with pytest.raises(
-        UserWarning, match="Peak memory usage exceeded allowed_mem when running tasks"
-    ):
-        b.compute(executor=executor, callbacks=[mem_warn])
+        num_created_arrays = 3
+        assert task_counter.value == num_created_arrays + 4
+    finally:
+        fs = fsspec.open(tmp_path).fs
+        fs.rm(tmp_path, recursive=True)
 
 
 def test_resume(spec, executor):
+    try:
+        from cubed.runtime.executors.beam import BeamDagExecutor
+
+        if isinstance(executor, BeamDagExecutor):
+            pytest.skip(f"{type(executor)} does not support resume")
+    except ImportError:
+        pass
+
+    try:
+        from cubed.runtime.executors.dask import DaskDelayedExecutor
+
+        if isinstance(executor, DaskDelayedExecutor):
+            pytest.skip(f"{type(executor)} does not support resume")
+    except ImportError:
+        pass
+
     a = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], chunks=(2, 2), spec=spec)
     b = xp.asarray([[1, 1, 1], [1, 1, 1], [1, 1, 1]], chunks=(2, 2), spec=spec)
     c = xp.add(a, b)
     d = xp.negative(c)
 
-    num_created_arrays = 2  # c, d
-    assert d.plan(optimize_graph=False).num_tasks == num_created_arrays + 8
+    num_created_arrays = 4  # a, b, c, d
+    assert d.plan.num_tasks(optimize_graph=False) == num_created_arrays + 8
 
     task_counter = TaskCounter()
     c.compute(executor=executor, callbacks=[task_counter], optimize_graph=False)
-    num_created_arrays = 1  # c
+    num_created_arrays = 3  # a, b, c
     assert task_counter.value == num_created_arrays + 4
 
     # since c has already been computed, when computing d only 4 tasks are run, instead of 8
     task_counter = TaskCounter()
     d.compute(
-        executor=executor,
-        callbacks=[task_counter],
-        optimize_graph=False,
-        resume=True,
+        executor=executor, callbacks=[task_counter], optimize_graph=False, resume=True
     )
     # the create arrays tasks are run again, even though they exist
-    num_created_arrays = 2  # c, d
+    num_created_arrays = 4  # a, b, c, d
     assert task_counter.value == num_created_arrays + 4
 
 
 @pytest.mark.parametrize("compute_arrays_in_parallel", [True, False])
 def test_compute_arrays_in_parallel(spec, any_executor, compute_arrays_in_parallel):
+    try:
+        from cubed.runtime.executors.beam import BeamDagExecutor
+
+        if isinstance(any_executor, BeamDagExecutor):
+            pytest.skip(
+                f"{type(any_executor)} does not support compute_arrays_in_parallel"
+            )
+    except ImportError:
+        pass
+
     a = cubed.random.random((10, 10), chunks=(5, 5), spec=spec)
     b = cubed.random.random((10, 10), chunks=(5, 5), spec=spec)
     c = xp.add(a, b)
@@ -289,150 +191,39 @@ def test_compute_arrays_in_parallel(spec, any_executor, compute_arrays_in_parall
 @pytest.mark.cloud
 @pytest.mark.parametrize("compute_arrays_in_parallel", [True, False])
 def test_compute_arrays_in_parallel_modal(modal_executor, compute_arrays_in_parallel):
+    from cubed.runtime.executors.modal_async import AsyncModalDagExecutor
+
+    if not isinstance(modal_executor, AsyncModalDagExecutor):
+        pytest.skip(
+            f"{type(modal_executor)} does not support compute_arrays_in_parallel"
+        )
+
     tmp_path = "s3://cubed-unittest/parallel_pipelines"
-    spec = cubed.Spec(
-        tmp_path, allowed_mem=100000, storage_options=dict(use_obstore=True)
-    )
+    spec = cubed.Spec(tmp_path, allowed_mem=100000)
+    try:
+        a = cubed.random.random((10, 10), chunks=(5, 5), spec=spec)
+        b = cubed.random.random((10, 10), chunks=(5, 5), spec=spec)
+        c = xp.add(a, b)
 
-    a = cubed.random.random((10, 10), chunks=(5, 5), spec=spec)
-    b = cubed.random.random((10, 10), chunks=(5, 5), spec=spec)
-    c = xp.add(a, b)
-
-    # note that this merely checks that compute_arrays_in_parallel is accepted
-    c.compute(
-        executor=modal_executor,
-        compute_arrays_in_parallel=compute_arrays_in_parallel,
-    )
-
-
-def test_check_runtime_memory_dask(spec, executor):
-    if executor.name != "dask":
-        pytest.skip(f"{executor.name} executor does not support check_runtime_memory")
-
-    spec = cubed.Spec(spec.work_dir, allowed_mem="4GB")  # larger than runtime memory
-    a = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], chunks=(2, 2), spec=spec)
-    b = xp.asarray([[1, 1, 1], [1, 1, 1], [1, 1, 1]], chunks=(2, 2), spec=spec)
-    c = xp.add(a, b)
-    with pytest.raises(
-        ValueError,
-        match=r"Runtime memory \(2000000000\) is less than allowed_mem \(4000000000\)",
-    ):
+        # note that this merely checks that compute_arrays_in_parallel is accepted
         c.compute(
-            executor=executor,
-            compute_kwargs=dict(memory_limit="2 GB", threads_per_worker=1),
+            executor=modal_executor,
+            compute_arrays_in_parallel=compute_arrays_in_parallel,
         )
-
-
-def test_check_runtime_memory_dask_no_workers(spec, executor):
-    if executor.name != "dask":
-        pytest.skip(f"{executor.name} executor does not support check_runtime_memory")
-
-    spec = cubed.Spec(spec.work_dir, allowed_mem=100000)
-    a = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], chunks=(2, 2), spec=spec)
-    b = xp.asarray([[1, 1, 1], [1, 1, 1], [1, 1, 1]], chunks=(2, 2), spec=spec)
-    c = xp.add(a, b)
-    with pytest.raises(ValueError, match=r"Cluster has no workers running"):
-        c.compute(
-            executor=executor,
-            compute_kwargs=dict(n_workers=0),
-        )
+    finally:
+        fs = fsspec.open(tmp_path).fs
+        fs.rm(tmp_path, recursive=True)
 
 
 @pytest.mark.cloud
 def test_check_runtime_memory_modal(spec, modal_executor):
     tmp_path = "s3://cubed-unittest/check-runtime-memory"
-    spec = cubed.Spec(
-        tmp_path,
-        allowed_mem="4GB",  # larger than Modal runtime memory
-        storage_options=dict(use_obstore=True),
-    )
+    spec = cubed.Spec(tmp_path, allowed_mem="4GB")  # larger than Modal runtime memory
     a = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], chunks=(2, 2), spec=spec)
     b = xp.asarray([[1, 1, 1], [1, 1, 1], [1, 1, 1]], chunks=(2, 2), spec=spec)
     c = xp.add(a, b)
     with pytest.raises(
         ValueError,
-        match=r"Runtime memory \(2000000000\) is less than allowed_mem \(4000000000\)",
+        match=r"Runtime memory \(2097152000\) is less than allowed_mem \(4000000000\)",
     ):
         c.compute(executor=modal_executor)
-
-
-def test_check_runtime_memory_processes(spec, executor):
-    if executor.name != "processes":
-        pytest.skip(f"{executor.name} executor does not support check_runtime_memory")
-
-    total_mem = psutil.virtual_memory().total
-    max_workers = os.cpu_count()
-    mem_per_worker = total_mem // max_workers
-    allowed_mem = mem_per_worker * 2  # larger than will fit
-
-    spec = cubed.Spec(spec.work_dir, allowed_mem=allowed_mem)
-    a = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], chunks=(2, 2), spec=spec)
-    b = xp.asarray([[1, 1, 1], [1, 1, 1], [1, 1, 1]], chunks=(2, 2), spec=spec)
-    c = xp.add(a, b)
-    with pytest.raises(
-        ValueError,
-        match=re.escape(
-            f"Total memory on machine ({total_mem}) is less than allowed_mem * max_workers ({allowed_mem} * {max_workers} = {allowed_mem * max_workers})"
-        ),
-    ):
-        c.compute(executor=executor)
-
-    # OK if we use fewer workers
-    c.compute(executor=executor, max_workers=max_workers // 2)
-
-
-COMPILE_FUNCTIONS = [lambda fn: fn]
-
-try:
-    from numba import jit as numba_jit
-
-    COMPILE_FUNCTIONS.append(numba_jit)
-except ModuleNotFoundError:
-    pass
-
-try:
-    if "jax" in os.environ.get("CUBED_BACKEND_ARRAY_API_MODULE", ""):
-        from jax import jit as jax_jit
-
-        COMPILE_FUNCTIONS.append(jax_jit)
-except ModuleNotFoundError:
-    pass
-
-
-@pytest.mark.parametrize("compile_function", COMPILE_FUNCTIONS)
-def test_check_compilation(spec, executor, compile_function):
-    a = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], chunks=(2, 2), spec=spec)
-    b = xp.asarray([[1, 1, 1], [1, 1, 1], [1, 1, 1]], chunks=(2, 2), spec=spec)
-    c = xp.add(a, b)
-    assert_array_equal(
-        c.compute(executor=executor, compile_function=compile_function),
-        np.array([[2, 3, 4], [5, 6, 7], [8, 9, 10]]),
-    )
-
-
-def test_compilation_can_fail(spec, executor):
-    def compile_function(func):
-        raise NotImplementedError(f"Cannot compile {func}")
-
-    a = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], chunks=(2, 2), spec=spec)
-    b = xp.asarray([[1, 1, 1], [1, 1, 1], [1, 1, 1]], chunks=(2, 2), spec=spec)
-    c = xp.add(a, b)
-    with pytest.raises(NotImplementedError) as excinfo:
-        c.compute(executor=executor, compile_function=compile_function)
-
-    assert "add" in str(excinfo.value), "Compile function was applied to add operation."
-
-
-def test_compilation_with_config_can_fail(spec, executor):
-    def compile_function(func, *, config=None):
-        raise NotImplementedError(f"Cannot compile {func} with {config}")
-
-    a = xp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], chunks=(2, 2), spec=spec)
-    b = xp.asarray([[1, 1, 1], [1, 1, 1], [1, 1, 1]], chunks=(2, 2), spec=spec)
-    c = xp.add(a, b)
-    with pytest.raises(NotImplementedError) as excinfo:
-        c.compute(executor=executor, compile_function=compile_function)
-
-    assert "BlockwiseSpec" in str(excinfo.value), (
-        "Compile function was applied with a config argument."
-    )

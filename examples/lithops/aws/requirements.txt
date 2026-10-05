@@ -1,4 +1,0 @@
-cubed
-lithops[aws]
-obstore
-rich

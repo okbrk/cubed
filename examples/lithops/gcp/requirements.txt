@@ -1,4 +1,0 @@
-cubed
-lithops[gcp]
-gcsfs
-rich

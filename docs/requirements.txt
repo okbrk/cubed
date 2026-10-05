@@ -1,34 +1,22 @@
 # cubed
-aiostream
-array-api-compat
+apache-beam
+fsspec
+lithops[aws] >= 2.7.0
+modal-client
 mypy_extensions # for rechunker
-ndindex
-networkx >= 3.3
-numpy >= 2
-psutil
+networkx < 2.8.3 # https://github.com/networkx/networkx/pull/5667
+numpy >= 1.22
 pydot
 pytest
 pytest-cov
 pytest-mock
+s3fs
 tenacity
 toolz
 tqdm
-zarr != 3.1.2
-cubed-xarray
-xarray
-pooch
-netCDF4
-icechunk
-graphviz
-jinja2
-pandas
-matplotlib
-rich
-seaborn
-anywidget
+zarr
 
 # docs
 sphinx-book-theme
 sphinx-autobuild
-sphinx-design
-myst-nb
+myst-parser

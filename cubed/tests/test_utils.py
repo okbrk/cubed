@@ -1,71 +1,30 @@
 import inspect
-import itertools
 import platform
 
 import numpy as np
 import pytest
 
-from cubed._testing import assert_array_equal
-from cubed.backend_array_api import namespace as nxp
 from cubed.utils import (
-    array_memory,
-    block_id_to_offset,
-    broadcast_trick,
+    chunk_memory,
     extract_stack_summaries,
-    is_cloud_storage_path,
-    is_local_path,
-    itemsize,
     join_path,
-    largest_chunk,
     memory_repr,
-    normalize_shape,
-    offset_to_block_id,
     peak_measured_mem,
     to_chunksize,
 )
 
 
-def test_array_memory():
-    assert array_memory(np.int64, (3,)) == 24
-    assert array_memory(np.int32, (3,)) == 12
-    assert array_memory(np.int32, (3, 5)) == 60
-    assert array_memory(np.int32, (0,)) == 0
-
-
-def test_itemsize():
-    assert itemsize(np.bool) == 1
-    assert itemsize(np.int32) == 4
-    assert itemsize(np.int64) == 8
-    assert itemsize(np.dtype(np.int64)) == 8
-    assert itemsize([("a", np.int32), ("b", np.int64)]) == 12
-    assert itemsize(np.dtype([("a", np.int32), ("b", np.int64)])) == 12
-
-
-def test_block_id_to_offset():
-    numblocks = (5, 3)
-    for block_id in itertools.product(*[list(range(n)) for n in numblocks]):
-        offset = block_id_to_offset(block_id, numblocks)
-        assert offset_to_block_id(offset, numblocks) == block_id
-
-    with pytest.raises(ValueError, match="invalid entry in coordinates array"):
-        block_id_to_offset((6, 12), numblocks)
-
-    with pytest.raises(ValueError, match="index 100 is out of bounds for array"):
-        offset_to_block_id(100, numblocks)
+def test_chunk_memory():
+    assert chunk_memory(np.int64, (3,)) == 24
+    assert chunk_memory(np.int32, (3,)) == 12
+    assert chunk_memory(np.int32, (3, 5)) == 60
+    assert chunk_memory(np.int32, (0,)) == 0
 
 
 def test_to_chunksize():
     assert to_chunksize(((3, 3, 3, 1),)) == (3,)
-    assert to_chunksize(((0,),)) == (1,)  # Zarr doesn't support zero-length chunks
-    with pytest.raises(ValueError, match="Array must have regular chunks"):
+    with pytest.raises(ValueError):
         to_chunksize(((3, 2, 3, 3, 1),))
-
-
-def test_largest_chunk():
-    assert largest_chunk((5, 2)) == (5, 2)
-    assert largest_chunk(((3, 3, 3, 1),)) == (3,)
-    assert largest_chunk(((3, 3, 3, 1), (2, 2, 2))) == (3, 2)
-    assert largest_chunk(((3, 2, 3, 3, 1), (3, 5, 3, 3, 2))) == (3, 5)
 
 
 def test_join_path():
@@ -87,26 +46,6 @@ def test_join_path():
     assert join_path("http://host/a path", "subpath") == "http://host/a%20path/subpath"
 
 
-def test_is_local_path():
-    assert is_local_path("relative_path/path")
-    assert is_local_path("/absolute_path/path")
-    assert is_local_path("file:relative_path/path")
-    assert is_local_path("file://absolute_path/path")
-    assert is_local_path("file:///absolute_path/path")
-    assert not is_local_path("s3://host/path")
-    assert not is_local_path("gs://host/path")
-
-
-def test_is_cloud_storage_path():
-    assert not is_cloud_storage_path("relative_path/path")
-    assert not is_cloud_storage_path("/absolute_path/path")
-    assert not is_cloud_storage_path("file:relative_path/path")
-    assert not is_cloud_storage_path("file://absolute_path/path")
-    assert not is_cloud_storage_path("file:///absolute_path/path")
-    assert is_cloud_storage_path("s3://host/path")
-    assert is_cloud_storage_path("gs://host/path")
-
-
 def test_memory_repr():
     assert memory_repr(0) == "0 bytes"
     assert memory_repr(1) == "1 bytes"
@@ -116,9 +55,7 @@ def test_memory_repr():
     assert memory_repr(1_000_000) == "1.0 MB"
     assert memory_repr(1_000_000_000_000_000) == "1.0 PB"
     assert memory_repr(int(1e18)) == "1.0e+18 bytes"
-    with pytest.raises(
-        ValueError, match="Invalid value: -1. Expected a positive integer."
-    ):
+    with pytest.raises(ValueError):
         memory_repr(-1)
 
 
@@ -133,26 +70,3 @@ def test_extract_stack_summaries():
     assert stack_summaries[-1].name == "test_extract_stack_summaries"
     assert stack_summaries[-1].module == "cubed.tests.test_utils"
     assert not stack_summaries[-1].is_cubed()
-
-
-def test_broadcast_trick():
-    a = nxp.ones((10, 10), dtype=nxp.int8)
-    b = broadcast_trick(nxp.ones)((10, 10), dtype=nxp.int8)
-
-    assert_array_equal(a, b)
-    assert a.nbytes == 100
-    assert b.base.nbytes == 1
-
-    a = nxp.ones((), dtype=nxp.int8)
-    b = broadcast_trick(nxp.ones)((), dtype=nxp.int8)
-    assert_array_equal(a, b)
-
-
-def test_normalize_shape():
-    assert normalize_shape(2) == (2,)
-    assert normalize_shape((2,)) == (2,)
-    assert normalize_shape((2, 0)) == (2, 0)
-    assert normalize_shape((2, 3)) == (2, 3)
-
-    with pytest.raises(TypeError):
-        normalize_shape(None)

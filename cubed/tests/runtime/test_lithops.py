@@ -8,14 +8,13 @@ from cubed.tests.runtime.utils import check_invocation_counts, deterministic_fai
 pytest.importorskip("lithops")
 
 from lithops.executors import LocalhostExecutor
-from lithops.retries import RetryingFunctionExecutor
 
 from cubed.runtime.executors.lithops import map_unordered
 
 
 def run_test(function, input, retries, timeout=10, use_backups=False):
     outputs = set()
-    with RetryingFunctionExecutor(LocalhostExecutor()) as executor:
+    with LocalhostExecutor() as executor:
         for output in map_unordered(
             executor,
             [function],
@@ -31,7 +30,7 @@ def run_test(function, input, retries, timeout=10, use_backups=False):
 
 # fmt: off
 @pytest.mark.parametrize(
-    ("timing_map", "n_tasks", "retries"),
+    "timing_map, n_tasks, retries",
     [
         # no failures
         ({}, 3, 2),
@@ -44,13 +43,11 @@ def run_test(function, input, retries, timeout=10, use_backups=False):
     ],
 )
 # fmt: on
-@pytest.mark.parametrize("use_backups", [False, True])
-def test_success(tmp_path, timing_map, n_tasks, retries, use_backups):
+def test_success(tmp_path, timing_map, n_tasks, retries):
     outputs = run_test(
         function=partial(deterministic_failure, tmp_path, timing_map),
         input=range(n_tasks),
         retries=retries,
-        use_backups=use_backups,
     )
 
     assert outputs == set(range(n_tasks))
@@ -60,21 +57,19 @@ def test_success(tmp_path, timing_map, n_tasks, retries, use_backups):
 
 # fmt: off
 @pytest.mark.parametrize(
-    ("timing_map", "n_tasks", "retries"),
+    "timing_map, n_tasks, retries",
     [
         # too many failures
         ({0: [-1], 1: [-1], 2: [-1, -1, -1]}, 3, 2),
     ],
 )
 # fmt: on
-@pytest.mark.parametrize("use_backups", [False, True])
-def test_failure(tmp_path, timing_map, n_tasks, retries, use_backups):
+def test_failure(tmp_path, timing_map, n_tasks, retries):
     with pytest.raises(RuntimeError):
         run_test(
             function=partial(deterministic_failure, tmp_path, timing_map),
             input=range(n_tasks),
             retries=retries,
-            use_backups=use_backups,
         )
 
     check_invocation_counts(tmp_path, timing_map, n_tasks, retries)
@@ -82,7 +77,7 @@ def test_failure(tmp_path, timing_map, n_tasks, retries, use_backups):
 
 # fmt: off
 @pytest.mark.parametrize(
-    ("timing_map", "n_tasks", "retries"),
+    "timing_map, n_tasks, retries",
     [
         ({0: [60]}, 10, 2),
     ],

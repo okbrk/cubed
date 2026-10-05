@@ -2,12 +2,10 @@
 omit =
     */tests/*
     cubed/array_api/*
-    cubed/diagnostics/memray.py
-    cubed/icechunk.py
+    cubed/extensions/*
+    cubed/runtime/executors/beam.py
     cubed/runtime/executors/coiled.py
     cubed/runtime/executors/dask*.py
     cubed/runtime/executors/lithops.py
     cubed/runtime/executors/modal*.py
-    cubed/runtime/executors/ray.py
-    cubed/runtime/executors/spark.py
     cubed/vendor/*

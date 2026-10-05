@@ -3,13 +3,10 @@
 # https://help.github.com/en/github/visualizing-repository-data-with-graphs/listing-the-packages-that-a-repository-depends-on
 
 aiostream
-array-api-compat
+fsspec
 mypy_extensions # for rechunker
-ndindex
-networkx >= 3.3
-numpy >= 2
-psutil
+networkx < 2.8.3
+numpy >= 1.22
 tenacity
 toolz
-zarr != 3.1.2
-pyspark
+zarr

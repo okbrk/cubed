@@ -1,75 +1,51 @@
+import numpy as np
 import pytest
-from zarr.codecs import BloscCodec, BytesCodec, ZstdCodec
-from zarr.storage import LocalStore, ObjectStore
+from numpy.testing import assert_array_equal
 
-from cubed import config
-from cubed.storage.store import open_storage_array
-from cubed.storage.zarr import lazy_zarr_array
+from cubed.storage.zarr import lazy_empty, lazy_from_array, lazy_full
 
 
-@pytest.mark.parametrize("use_obstore", [None, False, True])
-def test_lazy_zarr_array(tmp_path, use_obstore):
+def test_lazy_empty(tmp_path):
     zarr_path = tmp_path / "lazy.zarr"
-    if use_obstore is None:
-        kwargs = {}
-    else:
-        kwargs = dict(storage_options=dict(use_obstore=use_obstore))
-    arr = lazy_zarr_array(
-        zarr_path,
-        shape=(3, 3),
-        dtype=int,
-        chunks=(2, 2),
-        **kwargs,
-    )
+    arr = lazy_empty((3, 3), dtype=int, chunks=(2, 2), store=zarr_path)
 
     assert not zarr_path.exists()
-    with pytest.raises((FileNotFoundError, TypeError, ValueError)):
+    with pytest.raises(ValueError):
         arr.open()
 
-    za = arr.create()
-    if use_obstore:
-        assert isinstance(za.store, ObjectStore)
-    else:
-        assert isinstance(za.store, LocalStore)
+    arr.create()
     assert zarr_path.exists()
     arr.open()
 
 
-@pytest.mark.parametrize(
-    ("compressor", "expected_codecs"),
-    [
-        (None, (BytesCodec(),)),
-        ("auto", (BytesCodec(), ZstdCodec())),
-        (
-            {"name": "zstd", "configuration": {"level": 1}},
-            (BytesCodec(), ZstdCodec(level=1)),
-        ),
-        (
-            {
-                "name": "blosc",
-                "configuration": {
-                    "cname": "lz4",
-                    "clevel": 2,
-                    "shuffle": "shuffle",
-                },
-            },
-            (
-                BytesCodec(),
-                BloscCodec(cname="lz4", clevel=2, shuffle="shuffle", typesize=8),
-            ),
-        ),
-    ],
-)
-def test_compressor(tmp_path, compressor, expected_codecs):
+def test_lazy_from_array(tmp_path):
     zarr_path = tmp_path / "lazy.zarr"
+    a = np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]], dtype=int)
+    arr = lazy_from_array(a, dtype=a.dtype, chunks=(2, 2), store=zarr_path)
 
-    arr = lazy_zarr_array(
-        zarr_path, shape=(3, 3), dtype=int, chunks=(2, 2), compressors=compressor
-    )
+    assert not zarr_path.exists()
+    with pytest.raises(ValueError):
+        arr.open()
+
     arr.create()
+    assert zarr_path.exists()
+    assert_array_equal(arr.open()[:], a)
 
-    # open with zarr python
-    with config.set({"storage_name": "zarr-python"}):
-        z = open_storage_array(zarr_path, mode="r")
 
-    assert z.metadata.codecs == expected_codecs
+def test_lazy_full(tmp_path):
+    zarr_path = tmp_path / "lazy.zarr"
+    arr = lazy_full(
+        (3, 3),
+        1,
+        dtype=int,
+        chunks=(2, 2),
+        store=zarr_path,
+    )
+
+    assert not zarr_path.exists()
+    with pytest.raises(ValueError):
+        arr.open()
+
+    arr.create()
+    assert zarr_path.exists()
+    assert_array_equal(arr.open()[:], np.full((3, 3), 1, dtype=int))

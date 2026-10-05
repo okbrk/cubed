@@ -1,3 +1,0 @@
-recursive-include cubed *.css
-recursive-include cubed *.j2
-recursive-include cubed *.js
